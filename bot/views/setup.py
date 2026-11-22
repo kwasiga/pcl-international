@@ -31,6 +31,34 @@ class ClubLimitModal(discord.ui.Modal, title="Club limit"):
         await reply_error(interaction, error)
 
 
+class CountryCapModal(discord.ui.Modal, title="Players per country"):
+    value = discord.ui.TextInput(
+        label="Maximum players (blank = no cap)", required=False, max_length=5
+    )
+
+    def __init__(self, panel):
+        super().__init__()
+        self.panel = panel
+        self.value.default = str(panel.values["country_cap"] or "")
+
+    async def on_submit(self, interaction):
+        if not await self.panel.interaction_check(interaction):
+            return
+        try:
+            cap = int(self.value.value.strip()) if self.value.value.strip() else None
+            if cap is not None and cap < 1:
+                raise ValueError
+        except ValueError:
+            return await interaction.response.send_message(
+                "Enter a positive whole number, or leave blank for no cap.", ephemeral=True
+            )
+        self.panel.values["country_cap"] = cap
+        await interaction.response.edit_message(embed=self.panel.embed(), view=self.panel)
+
+    async def on_error(self, interaction, error):
+        await reply_error(interaction, error)
+
+
 class SetupPanel(StaffView):
     def __init__(self, engine, owner, guild, cfg, countries, clubs, positions=None):
         super().__init__(engine.db, owner, admin=True, timeout=600)
@@ -42,6 +70,7 @@ class SetupPanel(StaffView):
         self.values.update(
             countries=set(countries), clubs=set(clubs), club_limit=cfg["club_limit"] if cfg else 5
         )
+        self.values["country_cap"] = cfg.get("country_cap") if cfg else None
         self.values.update(
             {f"pos_{group}": set((positions or {}).get(group, ())) for group in POSITION_GROUPS}
         )
@@ -79,7 +108,9 @@ class SetupPanel(StaffView):
             ids = v[f"pos_{group}"]
             text = ", ".join(role(r) for r in sorted(ids)) or "Not configured"
             e.add_field(name=f"{group} position roles ({len(ids)})", value=text[:500], inline=False)
-        e.set_footer(text=f"Club limit: {v['club_limit']} • Balanced random • Unlimited respins")
+        e.set_footer(
+            text=f"Country cap: {v['country_cap'] or 'Unlimited'} • Club limit: {v['club_limit']} • Balanced random"
+        )
         return e
 
     def build(self):
@@ -126,6 +157,13 @@ class SetupPanel(StaffView):
 
         limit.callback = edit_limit
         self.add_item(limit)
+        cap_button = discord.ui.Button(label="Country player cap", row=3)
+
+        async def edit_cap(i):
+            await i.response.send_modal(CountryCapModal(self))
+
+        cap_button.callback = edit_cap
+        self.add_item(cap_button)
         save = discord.ui.Button(label="Save", style=discord.ButtonStyle.success, row=4)
 
         async def commit(i):

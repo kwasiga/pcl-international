@@ -164,14 +164,20 @@ class Engine:
 
     async def flag_capacity(self, con, gid, actor=None):
         cfg = await self.config(con, gid, allow_reset=True)
-        _, clubs = await self.counts(con, gid)
+        population, clubs = await self.counts(con, gid)
         violations = [
             {"country": country, "club": club, "count": count, "limit": cfg["club_limit"]}
             for (country, club), count in clubs.items()
             if count > cfg["club_limit"]
         ]
+        if cfg.get("country_cap") is not None:
+            violations.extend(
+                {"country": country, "count": count, "limit": cfg["country_cap"]}
+                for country, count in population.items()
+                if count > cfg["country_cap"]
+            )
         if violations:
-            await self.audit(con, gid, "club capacity violations", actor, violations=violations)
+            await self.audit(con, gid, "capacity violations", actor, violations=violations)
         return violations
 
     async def available(self, con, guild, uid, *, excluded=()):
@@ -198,6 +204,7 @@ class Engine:
             cfg["club_limit"],
             excluded,
             player_positions=player["position_groups"],
+            country_cap=cfg.get("country_cap"),
             position_counts=(await self.position_counts(con, guild.id, uid))
             if player["position_groups"]
             else None,
@@ -330,6 +337,8 @@ class Engine:
             raise RuleError(
                 "Position roles must be separate from country, club, staff and opt-in roles."
             )
+        if values.get("country_cap") is not None and values["country_cap"] < 1:
+            raise RuleError("Country player cap must be positive, or blank for no cap.")
         if values["club_limit"] < 1:
             raise RuleError("Club limit must be positive.")
         for role_id in countries:
@@ -390,9 +399,9 @@ class Engine:
                     )
                 await con.execute(
                     """INSERT INTO guild_config(guild_id,staff_role_id,opt_in_role_id,
-                  callups_channel_id,logs_channel_id,club_limit) VALUES($1,$2,$3,$4,$5,$6)
+                  callups_channel_id,logs_channel_id,club_limit,country_cap) VALUES($1,$2,$3,$4,$5,$6,$7)
                   ON CONFLICT(guild_id) DO UPDATE SET staff_role_id=$2,opt_in_role_id=$3,
-                  callups_channel_id=$4,logs_channel_id=$5,club_limit=$6,
+                  callups_channel_id=$4,logs_channel_id=$5,club_limit=$6,country_cap=$7,
                   revision=guild_config.revision+1,updated_at=now()""",
                     guild.id,
                     values["staff_role_id"],
@@ -400,6 +409,7 @@ class Engine:
                     values["callups_channel_id"],
                     values["logs_channel_id"],
                     values["club_limit"],
+                    values.get("country_cap"),
                 )
                 for kind, ids in [("country", countries), ("club", clubs)]:
                     await con.execute(
@@ -459,6 +469,7 @@ class Engine:
                     countries=sorted(countries),
                     clubs=sorted(clubs),
                     club_limit=values["club_limit"],
+                    country_cap=values.get("country_cap"),
                     positions=[
                         {
                             "position": group,
@@ -510,7 +521,15 @@ class Engine:
             validate_role(guild, guild.get_role(target))
             if player["club_conflict"]:
                 raise RuleError("Resolve multiple club roles with /club set first.")
-            _, clubs = await self.counts(con, gid, uid)
+            population, clubs = await self.counts(con, gid, uid)
+            if (
+                cfg.get("country_cap") is not None
+                and player["current_country_role_id"] != target
+                and population.get(target, 0) >= cfg["country_cap"]
+            ):
+                raise RuleError(
+                    "That country is at its player cap, including reserved places. Choose another country or raise the cap in /setup."
+                )
             club = player["primary_club_role_id"]
             if club and clubs.get((target, club), 0) >= cfg["club_limit"] and not override:
                 raise RuleError(
@@ -854,7 +873,20 @@ class Engine:
                 raise RuleError("Resolve this player’s primary club first with /club set.")
             if target not in await self.role_ids(con, member.guild.id, "country", True):
                 raise RuleError("Choose an enabled configured country role.")
-            _, clubs = await self.counts(con, member.guild.id, member.id)
+            population, clubs = await self.counts(con, member.guild.id, member.id)
+            current = await con.fetchval(
+                "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
+                member.guild.id,
+                member.id,
+            )
+            if (
+                cfg.get("country_cap") is not None
+                and current != target
+                and population.get(target, 0) >= cfg["country_cap"]
+            ):
+                raise RuleError(
+                    "That country is at its player cap, including reserved places. Choose another country or raise the cap in /setup."
+                )
             return club is not None and clubs.get((target, club), 0) >= cfg["club_limit"]
 
     async def draft(self, guild, actor):
@@ -1371,6 +1403,12 @@ class Engine:
                         if member.id not in players:
                             await self.enqueue(con, member, "opt_in")
             pop, clubs = await self.counts(con, guild.id)
+            if cfg.get("country_cap") is not None:
+                issues.extend(
+                    f"<@&{country}>: {count}/{cfg['country_cap']} players including reserved places — over country cap."
+                    for country, count in pop.items()
+                    if count > cfg["country_cap"]
+                )
             for (country, club), count in clubs.items():
                 if count > cfg["club_limit"]:
                     issues.append(

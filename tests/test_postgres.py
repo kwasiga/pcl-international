@@ -440,3 +440,46 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.fetchval("SELECT position_groups FROM players WHERE user_id=100"), ["ATT"]
         )
+
+    async def test_country_cap_counts_pending_and_cannot_be_manually_overridden(self):
+        async with self.db.guild(self.guild.id) as con:
+            await con.execute(
+                "UPDATE guild_config SET country_cap=1 WHERE guild_id=$1", self.guild.id
+            )
+        await self.engine.assign(self.guild.player(100, ()), 1, 77)
+        await self.engine.register(self.guild.player(101, ()))
+        newcomer = self.guild.player(102, ())
+        self.assertEqual(await self.engine.register(newcomer), "unassigned")
+        with self.assertRaisesRegex(RuleError, "player cap"):
+            await self.engine.assign(newcomer, 2, 77, override=True)
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 1
+        )
+
+    async def test_concurrent_registrations_respect_country_cap(self):
+        async with self.db.guild(self.guild.id) as con:
+            await con.execute(
+                "UPDATE guild_config SET country_cap=2 WHERE guild_id=$1", self.guild.id
+            )
+        members = [self.guild.player(uid, ()) for uid in range(100, 120)]
+        await asyncio.gather(*(self.engine.register(m) for m in members))
+        async with self.db.pool.acquire() as con:
+            population, _ = await self.engine.counts(con, self.guild.id)
+        self.assertEqual(sum(population.values()), 4)
+        self.assertTrue(all(n <= 2 for n in population.values()))
+
+    async def test_lowered_country_cap_preserves_existing_players(self):
+        first, second = self.guild.player(100, ()), self.guild.player(101, ())
+        await self.engine.assign(first, 1, 77)
+        await self.engine.assign(second, 1, 77)
+        async with self.db.guild(self.guild.id) as con:
+            await con.execute(
+                "UPDATE guild_config SET country_cap=1 WHERE guild_id=$1", self.guild.id
+            )
+            violations = await self.engine.flag_capacity(con, self.guild.id, 77)
+        self.assertTrue(any(v.get("country") == 1 for v in violations))
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 2
+        )
+        self.assertIn(self.guild.get_role(1), first.roles)
+        self.assertIn(self.guild.get_role(1), second.roles)

@@ -249,6 +249,11 @@ class StaffCommands(commands.Cog):
         for r in rows:
             groups[r["primary_club_role_id"]].append(r)
         lines = [f"**Total active players: {len(rows)}**"]
+        if cfg.get("country_cap") is not None:
+            lines.append(
+                f"Country cap: **{cfg['country_cap']}**"
+                + (" — **OVER CAP**" if len(rows) > cfg["country_cap"] else "")
+            )
         for club, players in groups.items():
             label = f"<@&{club}>" if club else "Unaffiliated / unresolved"
             warning = " — **OVER CLUB LIMIT**" if club and len(players) > cfg["club_limit"] else ""
@@ -313,6 +318,7 @@ class StaffCommands(commands.Cog):
         lines = [
             f"Cycle: **{cycle}**" + (" — **RESET RECOVERY**" if cfg["resetting"] else ""),
             f"Active players: **{active}**",
+            f"Player cap per country: **{cfg.get('country_cap') or 'Unlimited'}**",
             f"Enabled countries: **{countries}** • Clubs: **{clubs}**",
             f"Club limit: **{cfg['club_limit']}** • Capacity violations: **{violations}**",
             f"Unfinished role operations: **{unfinished}** • Queued messages: **{queued}**",

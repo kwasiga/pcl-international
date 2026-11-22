@@ -26,11 +26,14 @@ def choose_country(
     *,
     player_positions=(),
     position_counts=None,
+    country_cap=None,
 ):
     eligible = [
         c
         for c in countries
-        if c not in set(excluded) and (club is None or club_counts.get((c, club), 0) < limit)
+        if c not in set(excluded)
+        and (country_cap is None or population.get(c, 0) < country_cap)
+        and (club is None or club_counts.get((c, club), 0) < limit)
     ]
     if not eligible:
         return None

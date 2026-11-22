@@ -37,7 +37,7 @@ class PartialSetupTests(unittest.IsolatedAsyncioTestCase):
         await engine.save_config(SimpleNamespace(id=123, members=[]), values, 99)
         writes = [c for c in con.execute.call_args_list if "INSERT INTO guild_config" in c.args[0]]
         self.assertEqual(len(writes), 1)
-        self.assertEqual(writes[0].args[1:], (123, None, None, None, None, 5))
+        self.assertEqual(writes[0].args[1:], (123, None, None, None, None, 5, None))
 
     async def test_feature_reports_missing_callups_before_changing_roles(self):
         con = SimpleNamespace(
