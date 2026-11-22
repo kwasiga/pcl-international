@@ -1,0 +1,1374 @@
+"""Guild-serialized draft state machine and durable Discord role operation journal."""
+
+import json
+import logging
+from collections import defaultdict
+
+import discord
+
+from bot.services.audit import audit_messages
+from bot.services.roles import apply_roles, validate_role
+from bot.services.rules import (
+    RuleError,
+    callup_chunks,
+    choose_country,
+    occupancy,
+    primary_club,
+    POSITION_GROUPS,
+    player_positions,
+    position_occupancy,
+)
+
+log = logging.getLogger(__name__)
+
+
+class Engine:
+    def __init__(self, db, bot):
+        self.db, self.bot = db, bot
+
+    async def config(self, con, gid, *, allow_reset=False):
+        cfg = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", gid)
+        if not cfg:
+            raise RuleError("An Administrator must run /setup first.")
+        if cfg["resetting"] and not allow_reset:
+            raise RuleError("A reset is in progress. Use /status or /sync to inspect recovery.")
+        return cfg
+
+    async def cycle(self, con, gid):
+        return await con.fetchval(
+            "SELECT id FROM draft_cycles WHERE guild_id=$1 AND status <> 'closed'", gid
+        )
+
+    async def role_ids(self, con, gid, kind, enabled=False):
+        if kind not in ("country", "club"):
+            raise ValueError("Unknown role kind")
+        rows = await con.fetch(
+            f"SELECT role_id FROM {kind}_roles WHERE guild_id=$1"
+            + (" AND enabled" if enabled else ""),
+            gid,
+        )
+        return {r["role_id"] for r in rows}
+
+    async def audit(self, con, gid, action, actor=None, user=None, **details):
+        audit_id = await con.fetchval(
+            "INSERT INTO audit_logs(guild_id,actor_id,target_user_id,action,details) "
+            "VALUES($1,$2,$3,$4,$5::jsonb) RETURNING id",
+            gid,
+            actor,
+            user,
+            action,
+            json.dumps(details),
+        )
+        cfg = await con.fetchrow("SELECT logs_channel_id FROM guild_config WHERE guild_id=$1", gid)
+        if cfg:
+            for index, body in enumerate(audit_messages(action, actor, user, details)):
+                key = f"audit:{audit_id}" if index == 0 else f"audit:{audit_id}:part:{index}"
+                await self.outbox(con, gid, key, cfg["logs_channel_id"], body)
+
+    async def outbox(self, con, gid, key, channel, payload, batch=None):
+        await con.execute(
+            "INSERT INTO announcement_outbox "
+            "(guild_id,dedupe_key,channel_id,payload,batch_id) VALUES($1,$2,$3,$4,$5) "
+            "ON CONFLICT(dedupe_key) DO NOTHING",
+            gid,
+            key,
+            channel,
+            payload,
+            batch,
+        )
+
+    async def position_mapping(self, con, gid):
+        return {
+            r["role_id"]: r["position_group"]
+            for r in await con.fetch(
+                "SELECT role_id,position_group FROM position_roles WHERE guild_id=$1", gid
+            )
+        }
+
+    async def position_counts(self, con, gid, exclude_user=None):
+        rows = await con.fetch(
+            """
+          WITH seats AS (
+            SELECT user_id,current_country_role_id AS country FROM players
+              WHERE guild_id=$1 AND current_country_role_id IS NOT NULL
+            UNION
+            SELECT user_id,proposed_country_role_id FROM waitlist_entries
+              WHERE guild_id=$1 AND reservation_active
+            UNION
+            SELECT user_id,target_country_id FROM role_operations
+              WHERE guild_id=$1 AND status IN ('pending','failed') AND target_country_id IS NOT NULL
+          ) SELECT s.country,p.position_groups AS positions FROM seats s
+          JOIN players p ON p.guild_id=$1 AND p.user_id=s.user_id
+          WHERE ($2::bigint IS NULL OR s.user_id <> $2)
+        """,
+            gid,
+            exclude_user,
+        )
+        return position_occupancy(rows)
+
+    async def refresh_player(self, con, member):
+        gid, uid = member.guild.id, member.id
+        await con.execute(
+            "INSERT INTO players(guild_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING", gid, uid
+        )
+        saved = await con.fetchval(
+            "SELECT primary_club_role_id FROM players WHERE guild_id=$1 AND user_id=$2", gid, uid
+        )
+        clubs = await self.role_ids(con, gid, "club", True)
+        club, conflict = primary_club([r.id for r in member.roles], clubs, saved)
+        await con.execute(
+            "UPDATE players SET primary_club_role_id=$3,club_conflict=$4,present=TRUE,updated_at=now() "
+            "WHERE guild_id=$1 AND user_id=$2",
+            gid,
+            uid,
+            club,
+            conflict,
+        )
+        positions = player_positions(
+            [r.id for r in member.roles], await self.position_mapping(con, gid)
+        )
+        await con.execute(
+            "UPDATE players SET position_groups=$3 WHERE guild_id=$1 AND user_id=$2",
+            gid,
+            uid,
+            positions,
+        )
+        return club, conflict
+
+    async def counts(self, con, gid, exclude_user=None):
+        # Include durable pending operations, even if Discord applied a role before a crash.
+        # UNION avoids counting the same user/target reservation twice.
+        rows = await con.fetch(
+            """
+          WITH seats AS (
+            SELECT user_id,current_country_role_id AS country FROM players
+              WHERE guild_id=$1 AND current_country_role_id IS NOT NULL
+            UNION
+            SELECT user_id,proposed_country_role_id FROM waitlist_entries
+              WHERE guild_id=$1 AND reservation_active
+            UNION
+            SELECT user_id,target_country_id FROM role_operations
+              WHERE guild_id=$1 AND status IN ('pending','failed') AND target_country_id IS NOT NULL
+          ) SELECT s.country,p.primary_club_role_id AS club FROM seats s
+          JOIN players p ON p.guild_id=$1 AND p.user_id=s.user_id
+          WHERE ($2::bigint IS NULL OR s.user_id <> $2)
+        """,
+            gid,
+            exclude_user,
+        )
+        return occupancy(rows)
+
+    async def flag_capacity(self, con, gid, actor=None):
+        cfg = await self.config(con, gid, allow_reset=True)
+        _, clubs = await self.counts(con, gid)
+        violations = [
+            {"country": country, "club": club, "count": count, "limit": cfg["club_limit"]}
+            for (country, club), count in clubs.items()
+            if count > cfg["club_limit"]
+        ]
+        if violations:
+            await self.audit(con, gid, "club capacity violations", actor, violations=violations)
+        return violations
+
+    async def available(self, con, guild, uid, *, excluded=()):
+        cfg = await self.config(con, guild.id)
+        player = await con.fetchrow(
+            "SELECT * FROM players WHERE guild_id=$1 AND user_id=$2", guild.id, uid
+        )
+        if player["club_conflict"]:
+            raise RuleError("Select the player’s primary club with /club set first.")
+        countries = await self.role_ids(con, guild.id, "country", True)
+        manageable = set()
+        for cid in countries:
+            try:
+                validate_role(guild, guild.get_role(cid))
+                manageable.add(cid)
+            except RuleError:
+                pass
+        pop, clubs = await self.counts(con, guild.id, uid)
+        return choose_country(
+            manageable,
+            pop,
+            clubs,
+            player["primary_club_role_id"],
+            cfg["club_limit"],
+            excluded,
+            player_positions=player["position_groups"],
+            position_counts=(await self.position_counts(con, guild.id, uid))
+            if player["position_groups"]
+            else None,
+        )
+
+    async def idle_player(self, con, gid, uid):
+        if await con.fetchval(
+            "SELECT 1 FROM role_operations WHERE guild_id=$1 AND user_id=$2 "
+            "AND status IN ('pending','failed')",
+            gid,
+            uid,
+        ):
+            raise RuleError("This player has an unfinished role operation. Run /sync to retry it.")
+
+    async def enqueue(self, con, member, source="manual", actor=None, *, refresh=False):
+        gid, uid = member.guild.id, member.id
+        await self.config(con, gid)
+        await self.idle_player(con, gid, uid)
+        club, conflict = await self.refresh_player(con, member)
+        if await con.fetchval(
+            "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2", gid, uid
+        ):
+            if refresh:
+                return "active"
+            raise RuleError("This player already has an active country assignment.")
+        actual = {r.id for r in member.roles} & await self.role_ids(con, gid, "country")
+        # Existing roles without database assignments require explicit /assign reconciliation.
+        conflict = conflict or bool(actual)
+        existing = await con.fetchrow(
+            "SELECT * FROM waitlist_entries WHERE guild_id=$1 AND user_id=$2 "
+            "AND status NOT IN ('completed','removed')",
+            gid,
+            uid,
+        )
+        if existing and not refresh:
+            raise RuleError("This player is already on the waitlist.")
+        if existing and existing["status"] in ("processing", "failed"):
+            return existing["status"]
+        if existing:
+            await con.execute(
+                "UPDATE waitlist_entries SET reservation_active=FALSE WHERE id=$1", existing["id"]
+            )
+        country = None if conflict else await self.available(con, member.guild, uid)
+        status = "blocked" if conflict else ("pending" if country else "unassigned")
+        if existing:
+            await con.execute(
+                "UPDATE waitlist_entries SET proposed_country_role_id=$2,status=$3,"
+                "reservation_active=$4,updated_at=now() WHERE id=$1",
+                existing["id"],
+                country,
+                status,
+                country is not None,
+            )
+        else:
+            await con.execute(
+                "INSERT INTO waitlist_entries(guild_id,cycle_id,user_id,proposed_country_role_id,"
+                "registration_source,status,reservation_active) VALUES($1,$2,$3,$4,$5,$6,$7)",
+                gid,
+                await self.cycle(con, gid),
+                uid,
+                country,
+                source,
+                status,
+                country is not None,
+            )
+        await self.audit(
+            con, gid, "waitlist registration", actor, uid, status=status, country=country, club=club
+        )
+        return status
+
+    async def register(self, member, source="manual", actor=None):
+        async with self.db.guild(member.guild.id) as con:
+            async with con.transaction():
+                return await self.enqueue(con, member, source, actor)
+
+    async def remove_waitlist(self, member, actor):
+        async with self.db.guild(member.guild.id) as con:
+            await self.config(con, member.guild.id)
+            await self.idle_player(con, member.guild.id, member.id)
+            result = await con.execute(
+                "UPDATE waitlist_entries SET status='removed',reservation_active=FALSE,updated_at=now() "
+                "WHERE guild_id=$1 AND user_id=$2 AND status NOT IN ('completed','removed')",
+                member.guild.id,
+                member.id,
+            )
+            await self.audit(con, member.guild.id, "waitlist removal", actor, member.id)
+            return result != "UPDATE 0"
+
+    async def reconcile_waitlist(self, con, guild):
+        # Rebuild reservations in original registration order after config/club changes.
+        rows = await con.fetch(
+            "SELECT * FROM waitlist_entries WHERE guild_id=$1 "
+            "AND status IN ('pending','blocked','unassigned','absent') ORDER BY id",
+            guild.id,
+        )
+        if not rows:
+            return
+        await con.execute(
+            "UPDATE waitlist_entries SET reservation_active=FALSE WHERE guild_id=$1 "
+            "AND status IN ('pending','blocked','unassigned','absent')",
+            guild.id,
+        )
+        for row in rows:
+            member = guild.get_member(row["user_id"])
+            if not member:
+                await con.execute(
+                    "UPDATE waitlist_entries SET status='absent',proposed_country_role_id=NULL,"
+                    "updated_at=now() WHERE id=$1",
+                    row["id"],
+                )
+            else:
+                await self.enqueue(con, member, row["registration_source"], refresh=True)
+
+    async def save_config(self, guild, values, actor, expected_revision=None):
+        countries, clubs = set(values["countries"]), set(values["clubs"])
+        position_roles = {}
+        for group in POSITION_GROUPS:
+            for rid in values.get(f"pos_{group}", set()):
+                if rid in position_roles:
+                    raise RuleError(
+                        "Each position role must belong to one position group. Players can hold roles from multiple groups."
+                    )
+                role = guild.get_role(rid)
+                if not role or role.is_default():
+                    raise RuleError("Select existing position roles other than @everyone.")
+                position_roles[rid] = group
+        if set(position_roles) & (
+            countries | clubs | {values.get("staff_role_id"), values.get("opt_in_role_id")}
+        ):
+            raise RuleError(
+                "Position roles must be separate from country, club, staff and opt-in roles."
+            )
+        if not countries or not values.get("staff_role_id") or not values.get("opt_in_role_id"):
+            raise RuleError("Select a staff role, opt-in role, and at least one country.")
+        if values["club_limit"] < 1:
+            raise RuleError("Club limit must be positive.")
+        for role_id in countries:
+            validate_role(guild, guild.get_role(role_id))
+        if countries & clubs or values["opt_in_role_id"] in countries | clubs:
+            raise RuleError("Country, club and opt-in roles must be separate.")
+        for key in ("staff_role_id", "opt_in_role_id"):
+            role = guild.get_role(values[key])
+            if not role or role.is_default():
+                raise RuleError("Select an existing role other than @everyone.")
+        validate_role(guild, guild.get_role(values["opt_in_role_id"]))
+        for cid in clubs:
+            if not guild.get_role(cid) or guild.get_role(cid).is_default():
+                raise RuleError("A selected club role no longer exists.")
+        for key in ("callups_channel_id", "logs_channel_id"):
+            channel = guild.get_channel(values.get(key))
+            if not isinstance(channel, discord.TextChannel):
+                raise RuleError("Select text channels for call-ups and staff logs.")
+            perms = channel.permissions_for(guild.me)
+            if not (perms.view_channel and perms.send_messages and perms.read_message_history):
+                raise RuleError(
+                    "The bot needs View Channel, Send Messages and Read Message History in both channels."
+                )
+        async with self.db.guild(guild.id) as con:
+            async with con.transaction():
+                old = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", guild.id)
+                if old and old["respin_role_id"] in countries | clubs | set(position_roles) | {
+                    values["opt_in_role_id"],
+                    values["staff_role_id"],
+                }:
+                    raise RuleError(
+                        "The bot's Respun marker must stay separate from country, club, staff and opt-in roles."
+                    )
+                if old and old["revision"] != expected_revision:
+                    raise RuleError("Setup changed while this panel was open. Reopen /setup.")
+                if old and (
+                    old["resetting"]
+                    or await con.fetchval(
+                        "SELECT 1 FROM role_operations WHERE guild_id=$1 AND status IN ('pending','failed')",
+                        guild.id,
+                    )
+                ):
+                    raise RuleError(
+                        "Resolve running or failed role operations before changing setup."
+                    )
+                await con.execute(
+                    """INSERT INTO guild_config(guild_id,staff_role_id,opt_in_role_id,
+                  callups_channel_id,logs_channel_id,club_limit) VALUES($1,$2,$3,$4,$5,$6)
+                  ON CONFLICT(guild_id) DO UPDATE SET staff_role_id=$2,opt_in_role_id=$3,
+                  callups_channel_id=$4,logs_channel_id=$5,club_limit=$6,
+                  revision=guild_config.revision+1,updated_at=now()""",
+                    guild.id,
+                    values["staff_role_id"],
+                    values["opt_in_role_id"],
+                    values["callups_channel_id"],
+                    values["logs_channel_id"],
+                    values["club_limit"],
+                )
+                for kind, ids in [("country", countries), ("club", clubs)]:
+                    await con.execute(
+                        f"UPDATE {kind}_roles SET enabled=FALSE WHERE guild_id=$1", guild.id
+                    )
+                    for role_id in ids:
+                        await con.execute(
+                            f"INSERT INTO {kind}_roles(guild_id,role_id) VALUES($1,$2) "
+                            "ON CONFLICT(guild_id,role_id) DO UPDATE SET enabled=TRUE",
+                            guild.id,
+                            role_id,
+                        )
+                await con.execute("DELETE FROM position_roles WHERE guild_id=$1", guild.id)
+                for rid, group in position_roles.items():
+                    await con.execute(
+                        "INSERT INTO position_roles(guild_id,role_id,position_group) VALUES($1,$2,$3)",
+                        guild.id,
+                        rid,
+                        group,
+                    )
+                if not await self.cycle(con, guild.id):
+                    await con.execute("INSERT INTO draft_cycles(guild_id) VALUES($1)", guild.id)
+                for member in guild.members:
+                    if member.bot:
+                        continue
+                    if await con.fetchval(
+                        "SELECT 1 FROM players WHERE guild_id=$1 AND user_id=$2",
+                        guild.id,
+                        member.id,
+                    ):
+                        await self.refresh_player(con, member)
+                await self.reconcile_waitlist(con, guild)
+                for member in guild.members:
+                    if member.bot or not any(
+                        r.id == values["opt_in_role_id"] for r in member.roles
+                    ):
+                        continue
+                    known = await con.fetchval(
+                        "SELECT current_country_role_id IS NOT NULL OR EXISTS("
+                        "SELECT 1 FROM waitlist_entries WHERE guild_id=$1 AND user_id=$2 AND status NOT IN ('completed','removed')) "
+                        "FROM players WHERE guild_id=$1 AND user_id=$2",
+                        guild.id,
+                        member.id,
+                    )
+                    if not known and not await con.fetchval(
+                        "SELECT 1 FROM assignment_history WHERE guild_id=$1 AND user_id=$2",
+                        guild.id,
+                        member.id,
+                    ):
+                        await self.enqueue(con, member, "opt_in")
+                await self.flag_capacity(con, guild.id, actor)
+                await self.audit(
+                    con,
+                    guild.id,
+                    "configuration saved",
+                    actor,
+                    countries=sorted(countries),
+                    clubs=sorted(clubs),
+                    club_limit=values["club_limit"],
+                    positions=[
+                        {
+                            "position": group,
+                            "roles": [rid for rid, pos in position_roles.items() if pos == group],
+                        }
+                        for group in POSITION_GROUPS
+                    ],
+                )
+
+    async def prepare_operation(
+        self, con, guild, uid, target, action, actor, *, override=False, batch=None
+    ):
+        gid = guild.id
+        cfg = await self.config(con, gid, allow_reset=action == "reset")
+        await self.idle_player(con, gid, uid)
+        member = guild.get_member(uid)
+        if member:
+            try:
+                member = await guild.fetch_member(uid)
+            except discord.NotFound:
+                member = None
+        if member:
+            await self.refresh_player(con, member)
+        elif target:
+            raise RuleError("The player is no longer in the server.")
+        player = await con.fetchrow(
+            "SELECT * FROM players WHERE guild_id=$1 AND user_id=$2", gid, uid
+        )
+        if not player:
+            await con.execute(
+                "INSERT INTO players(guild_id,user_id,present) VALUES($1,$2,$3)",
+                gid,
+                uid,
+                member is not None,
+            )
+            player = await con.fetchrow(
+                "SELECT * FROM players WHERE guild_id=$1 AND user_id=$2", gid, uid
+            )
+        if action == "remove" and not player["current_country_role_id"]:
+            raise RuleError("This player has no active country assignment to remove.")
+        if target:
+            if target not in await self.role_ids(con, gid, "country", True):
+                raise RuleError("Choose an enabled configured national team.")
+            validate_role(guild, guild.get_role(target))
+            if player["club_conflict"]:
+                raise RuleError("Resolve multiple club roles with /club set first.")
+            _, clubs = await self.counts(con, gid, uid)
+            club = player["primary_club_role_id"]
+            if club and clubs.get((target, club), 0) >= cfg["club_limit"] and not override:
+                raise RuleError(
+                    "Club limit reached. Reopen /assign to explicitly confirm an override."
+                )
+        opid = await con.fetchval(
+            """INSERT INTO role_operations(guild_id,cycle_id,user_id,
+            from_country_id,target_country_id,action,actor_id,override_type,batch_id)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id""",
+            gid,
+            await self.cycle(con, gid),
+            uid,
+            player["current_country_role_id"],
+            target,
+            action,
+            actor,
+            "club_capacity" if override else None,
+            batch,
+        )
+        # A manual assignment replaces any existing pending reservation atomically.
+        await con.execute(
+            "UPDATE waitlist_entries SET status='processing',reservation_active=FALSE,updated_at=now() "
+            "WHERE guild_id=$1 AND user_id=$2 AND status NOT IN ('completed','removed')",
+            gid,
+            uid,
+        )
+        return opid
+
+    async def ensure_respin_role(self, con, guild):
+        cfg = await self.config(con, guild.id, allow_reset=True)
+        role = guild.get_role(cfg["respin_role_id"]) if cfg["respin_role_id"] else None
+        if role is None:
+            if not guild.me or not guild.me.guild_permissions.manage_roles:
+                raise RuleError("The bot needs Manage Roles to create the Respun role.")
+            # Reuse a safe same-name role after a crash between Discord creation and
+            # persisting its ID, rather than leaving duplicate marker roles behind.
+            reserved = await self.role_ids(con, guild.id, "country")
+            reserved |= await self.role_ids(con, guild.id, "club")
+            reserved |= set(await self.position_mapping(con, guild.id))
+            reserved |= {cfg["opt_in_role_id"], cfg["staff_role_id"]}
+            role = next(
+                (
+                    r
+                    for r in guild.roles
+                    if r.name == "Respun"
+                    and r.id not in reserved
+                    and not r.managed
+                    and r.permissions.value == 0
+                ),
+                None,
+            )
+            if role is None:
+                role = await guild.create_role(
+                    name="Respun",
+                    colour=discord.Colour.purple(),
+                    permissions=discord.Permissions.none(),
+                    hoist=False,
+                    mentionable=False,
+                    reason="PCL International: confirmed respin marker",
+                )
+            await con.execute(
+                "UPDATE guild_config SET respin_role_id=$2 WHERE guild_id=$1", guild.id, role.id
+            )
+        validate_role(guild, role)
+        return role.id
+
+    async def execute_operation(self, con, guild, opid):
+        op = await con.fetchrow("SELECT * FROM role_operations WHERE id=$1", opid)
+        if op["status"] == "completed":
+            return True
+        try:
+            cfg = await self.config(con, guild.id, allow_reset=True)
+            already_respun = await con.fetchval(
+                "SELECT has_respun FROM players WHERE guild_id=$1 AND user_id=$2",
+                guild.id,
+                op["user_id"],
+            )
+            mark_respun = (
+                op["clear_country_ids"] is None
+                and bool(op["target_country_id"])
+                and (op["action"].startswith("respin") or already_respun)
+            )
+            respin_role_id = (
+                await self.ensure_respin_role(con, guild) if mark_respun else cfg["respin_role_id"]
+            )
+            await apply_roles(
+                guild,
+                op["user_id"],
+                await self.role_ids(con, guild.id, "country"),
+                op["target_country_id"],
+                f"PCL International: {op['action']}",
+                opt_in_role_id=cfg["opt_in_role_id"],
+                respin_role_id=respin_role_id,
+                mark_respun=mark_respun,
+                clear_respun=op["action"] in {"remove", "reset", "clear"},
+                clear_country_ids=op["clear_country_ids"],
+            )
+        except (discord.HTTPException, RuleError) as exc:
+            async with con.transaction():
+                await con.execute(
+                    "UPDATE role_operations SET status='failed',attempts=attempts+1,last_error=$2,"
+                    "updated_at=now() WHERE id=$1",
+                    opid,
+                    str(exc)[:1000],
+                )
+                await con.execute(
+                    "UPDATE waitlist_entries SET status='failed',updated_at=now() "
+                    "WHERE guild_id=$1 AND user_id=$2 AND status='processing'",
+                    guild.id,
+                    op["user_id"],
+                )
+                if op["batch_id"]:
+                    await con.execute(
+                        "UPDATE draft_batch_items SET status='failed',attempts=attempts+1,last_error=$3 "
+                        "WHERE batch_id=$1 AND user_id=$2",
+                        op["batch_id"],
+                        op["user_id"],
+                        str(exc)[:1000],
+                    )
+                if op["attempts"] == 0:
+                    await self.audit(
+                        con,
+                        guild.id,
+                        "role operation failed",
+                        op["actor_id"],
+                        op["user_id"],
+                        operation=opid,
+                        error=str(exc)[:1000],
+                    )
+            return False
+        if op["action"] in {"restore", "role_cleanup", "clear_extra"}:
+            async with con.transaction():
+                await con.execute(
+                    "UPDATE role_operations SET status='completed',attempts=attempts+1,last_error=NULL,updated_at=now() WHERE id=$1",
+                    opid,
+                )
+                await self.audit(
+                    con,
+                    guild.id,
+                    "returning member restored"
+                    if op["action"] == "restore"
+                    else "assignment roles updated",
+                    user=op["user_id"],
+                    country=op["target_country_id"],
+                )
+            return True
+        # Commit only after the remote role set has been fetched and verified.
+        async with con.transaction():
+            gid, uid, target = guild.id, op["user_id"], op["target_country_id"]
+            await con.execute(
+                "UPDATE assignments SET status='ended',ended_at=now() WHERE guild_id=$1 "
+                "AND user_id=$2 AND status='active'",
+                gid,
+                uid,
+            )
+            if target:
+                await con.execute(
+                    "INSERT INTO assignments(guild_id,cycle_id,user_id,country_role_id,club_role_id) "
+                    "SELECT $1,$2,$3,$4,primary_club_role_id FROM players WHERE guild_id=$1 AND user_id=$3",
+                    gid,
+                    op["cycle_id"],
+                    uid,
+                    target,
+                )
+                await con.execute(
+                    "INSERT INTO cycle_exclusions VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                    gid,
+                    op["cycle_id"],
+                    uid,
+                    target,
+                )
+            elif op["action"] in {"remove", "clear"}:
+                await con.execute(
+                    "DELETE FROM cycle_exclusions WHERE guild_id=$1 AND user_id=$2 AND cycle_id=$3",
+                    gid,
+                    uid,
+                    op["cycle_id"],
+                )
+            await con.execute(
+                "UPDATE players SET current_country_role_id=$3,has_respun=$4,updated_at=now() WHERE guild_id=$1 AND user_id=$2",
+                gid,
+                uid,
+                target,
+                mark_respun,
+            )
+            await con.execute(
+                "INSERT INTO assignment_history(guild_id,cycle_id,user_id,from_country_id,to_country_id,"
+                "action,actor_id,override_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+                gid,
+                op["cycle_id"],
+                uid,
+                op["from_country_id"],
+                target,
+                op["action"],
+                op["actor_id"],
+                op["override_type"],
+            )
+            if op["action"] != "clear":
+                await con.execute(
+                    "UPDATE waitlist_entries SET status='completed',reservation_active=FALSE,updated_at=now() "
+                    "WHERE guild_id=$1 AND user_id=$2 AND status NOT IN ('completed','removed')",
+                    gid,
+                    uid,
+                )
+            await con.execute(
+                "UPDATE role_operations SET status='completed',attempts=attempts+1,last_error=NULL,"
+                "updated_at=now() WHERE id=$1",
+                opid,
+            )
+            if op["batch_id"]:
+                await con.execute(
+                    "UPDATE draft_batch_items SET status='completed',attempts=attempts+1,last_error=NULL "
+                    "WHERE batch_id=$1 AND user_id=$2",
+                    op["batch_id"],
+                    uid,
+                )
+            elif target:
+                cfg = await self.config(con, gid, allow_reset=True)
+                old = op["from_country_id"]
+                if old and old != target:
+                    verb = "reassigned" if op["action"].startswith("respin") else "transferred"
+                    body = f"**<@{uid}> has been {verb} from <@&{old}> to <@&{target}>!**"
+                else:
+                    body = f"**<@{uid}> has been assigned to <@&{target}>!**"
+                await self.outbox(con, gid, f"operation:{opid}", cfg["callups_channel_id"], body)
+            await self.audit(
+                con,
+                gid,
+                op["action"],
+                op["actor_id"],
+                uid,
+                previous=op["from_country_id"],
+                country=target,
+                override=op["override_type"],
+                operation=opid,
+            )
+        return True
+
+    async def assign(
+        self,
+        member,
+        country,
+        actor,
+        *,
+        override=False,
+        expected=None,
+        expected_cycle=None,
+        action="manual",
+    ):
+        async with self.db.guild(member.guild.id) as con:
+            async with con.transaction():
+                await self.config(con, member.guild.id)
+                if (
+                    expected_cycle is not None
+                    and await self.cycle(con, member.guild.id) != expected_cycle
+                ):
+                    raise RuleError("The draft cycle changed. Open a new confirmation.")
+                await self.refresh_player(con, member)
+                current = await con.fetchval(
+                    "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
+                    member.guild.id,
+                    member.id,
+                )
+                if expected is not None and current != expected:
+                    raise RuleError("The player’s country changed. Request a new proposal.")
+                if action.startswith("respin"):
+                    if not current or current == country:
+                        raise RuleError(
+                            "The player must have a different active country to respin."
+                        )
+                    used = await con.fetchval(
+                        "SELECT 1 FROM cycle_exclusions WHERE guild_id=$1 AND cycle_id=$2 "
+                        "AND user_id=$3 AND country_role_id=$4",
+                        member.guild.id,
+                        await self.cycle(con, member.guild.id),
+                        member.id,
+                        country,
+                    )
+                    if used and action != "respin_exception":
+                        raise RuleError(
+                            "This player already represented that country. Request a new proposal."
+                        )
+                    if action == "respin_exception":
+                        unused = await self.respin_target(con, member)
+                        if unused:
+                            raise RuleError(
+                                "An unused country is now available. Request a new random respin."
+                            )
+                opid = await self.prepare_operation(
+                    con, member.guild, member.id, country, action, actor, override=override
+                )
+            return await self.execute_operation(con, member.guild, opid)
+
+    async def respin_target(self, con, member):
+        gid, uid = member.guild.id, member.id
+        current = await con.fetchval(
+            "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2", gid, uid
+        )
+        if not current:
+            raise RuleError("This player has no active country assignment.")
+        used = await con.fetch(
+            "SELECT country_role_id FROM cycle_exclusions WHERE guild_id=$1 AND cycle_id=$2 AND user_id=$3",
+            gid,
+            await self.cycle(con, gid),
+            uid,
+        )
+        return await self.available(
+            con, member.guild, uid, excluded={current} | {r["country_role_id"] for r in used}
+        )
+
+    async def propose_respin(self, member):
+        async with self.db.guild(member.guild.id) as con:
+            await self.config(con, member.guild.id)
+            await self.idle_player(con, member.guild.id, member.id)
+            await self.refresh_player(con, member)
+            current = await con.fetchval(
+                "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
+                member.guild.id,
+                member.id,
+            )
+            target = await self.respin_target(con, member)
+            exceptions = []
+            if target is None:
+                countries = await self.role_ids(con, member.guild.id, "country", True)
+                for cid in sorted(countries - {current}):
+                    # Evaluate capacity without relaxing the club rule.
+                    if (
+                        await self.available(
+                            con, member.guild, member.id, excluded=countries - {cid}
+                        )
+                        == cid
+                    ):
+                        exceptions.append(cid)
+            return current, target, exceptions
+
+    async def needs_override(self, member, target):
+        async with self.db.guild(member.guild.id) as con:
+            cfg = await self.config(con, member.guild.id)
+            club, conflict = await self.refresh_player(con, member)
+            if conflict:
+                raise RuleError("Resolve this player’s primary club first with /club set.")
+            if target not in await self.role_ids(con, member.guild.id, "country", True):
+                raise RuleError("Choose an enabled configured country role.")
+            _, clubs = await self.counts(con, member.guild.id, member.id)
+            return club is not None and clubs.get((target, club), 0) >= cfg["club_limit"]
+
+    async def draft(self, guild, actor):
+        async with self.db.guild(guild.id) as con:
+            async with con.transaction():
+                await self.config(con, guild.id)
+                if await con.fetchval(
+                    "SELECT 1 FROM draft_batches WHERE guild_id=$1 AND status='processing'",
+                    guild.id,
+                ):
+                    raise RuleError("An earlier draft is still running or recovering. Run /sync.")
+                await self.reconcile_waitlist(con, guild)
+                rows = await con.fetch(
+                    "SELECT * FROM waitlist_entries WHERE guild_id=$1 AND status='pending' ORDER BY id",
+                    guild.id,
+                )
+                if not rows:
+                    raise RuleError("There are no eligible pending players.")
+                batch = await con.fetchval(
+                    "INSERT INTO draft_batches(guild_id,cycle_id,started_by) VALUES($1,$2,$3) RETURNING id",
+                    guild.id,
+                    await self.cycle(con, guild.id),
+                    actor,
+                )
+                # Freeze the entire batch and persist all operations before the first Discord call.
+                for row in rows:
+                    await self.prepare_operation(
+                        con,
+                        guild,
+                        row["user_id"],
+                        row["proposed_country_role_id"],
+                        "draft",
+                        actor,
+                        batch=batch,
+                    )
+                    await con.execute(
+                        "INSERT INTO draft_batch_items(batch_id,user_id,target_country_id) VALUES($1,$2,$3)",
+                        batch,
+                        row["user_id"],
+                        row["proposed_country_role_id"],
+                    )
+            ops = await con.fetch(
+                "SELECT id FROM role_operations WHERE batch_id=$1 ORDER BY id", batch
+            )
+            succeeded = 0
+            for op in ops:
+                succeeded += await self.execute_operation(con, guild, op["id"])
+            await self.finish_batches(con, guild)
+            return succeeded, len(ops) - succeeded
+
+    async def finish_batches(self, con, guild):
+        batches = await con.fetch(
+            "SELECT id FROM draft_batches WHERE guild_id=$1 AND status='processing'", guild.id
+        )
+        for batch in batches:
+            # Announce every newly completed subset; deterministic keys prevent normal duplicates.
+            completed = await con.fetch(
+                "SELECT id,user_id,target_country_id FROM role_operations "
+                "WHERE batch_id=$1 AND status='completed' AND NOT EXISTS("
+                "SELECT 1 FROM announcement_outbox WHERE dedupe_key='batch-player:' || role_operations.id::text)",
+                batch["id"],
+            )
+            if completed:
+                cfg = await self.config(con, guild.id, allow_reset=True)
+                grouped = defaultdict(list)
+                for row in completed:
+                    grouped[row["target_country_id"]].append(row["user_id"])
+                country_names = {}
+                for country_id in grouped:
+                    role = guild.get_role(country_id)
+                    country_names[country_id] = discord.utils.escape_markdown(
+                        discord.utils.escape_mentions(role.name if role else "Country")
+                    )
+                async with con.transaction():
+                    for i, chunk in enumerate(callup_chunks(grouped, country_names=country_names)):
+                        await self.outbox(
+                            con,
+                            guild.id,
+                            f"batch:{batch['id']}:part:{completed[0]['id']}:{i}",
+                            cfg["callups_channel_id"],
+                            chunk,
+                            batch["id"],
+                        )
+                    # Sentinels are never delivered; they track which players have been queued.
+                    for row in completed:
+                        await con.execute(
+                            "INSERT INTO announcement_outbox(guild_id,batch_id,dedupe_key,channel_id,payload,status) "
+                            "VALUES($1,$2,$3,$4,'','marker') ON CONFLICT DO NOTHING",
+                            guild.id,
+                            batch["id"],
+                            f"batch-player:{row['id']}",
+                            cfg["callups_channel_id"],
+                        )
+            if not await con.fetchval(
+                "SELECT 1 FROM role_operations WHERE batch_id=$1 AND status <> 'completed'",
+                batch["id"],
+            ):
+                await con.execute(
+                    "UPDATE draft_batches SET status='completed',completed_at=now() WHERE id=$1",
+                    batch["id"],
+                )
+
+    async def set_club(self, member, role, actor):
+        async with self.db.guild(member.guild.id) as con:
+            async with con.transaction():
+                await self.config(con, member.guild.id)
+                await self.idle_player(con, member.guild.id, member.id)
+                if role not in member.roles or role.id not in await self.role_ids(
+                    con, member.guild.id, "club", True
+                ):
+                    raise RuleError("The player must currently hold that enabled club role.")
+                await self.refresh_player(con, member)
+                await con.execute(
+                    "UPDATE players SET primary_club_role_id=$3,club_conflict=FALSE WHERE guild_id=$1 AND user_id=$2",
+                    member.guild.id,
+                    member.id,
+                    role.id,
+                )
+                await self.reconcile_waitlist(con, member.guild)
+                await self.flag_capacity(con, member.guild.id, actor)
+                await self.audit(
+                    con, member.guild.id, "primary club selected", actor, member.id, club=role.id
+                )
+
+    async def clear_countries(self, guild, actor, country=None, expected_cycle=None):
+        async with self.db.guild(guild.id) as con:
+            async with con.transaction():
+                await self.config(con, guild.id)
+                cycle = await self.cycle(con, guild.id)
+                if expected_cycle is not None and cycle != expected_cycle:
+                    raise RuleError("The draft cycle changed. Reopen /clear.")
+                managed = await self.role_ids(con, guild.id, "country")
+                if country is not None and country not in managed:
+                    raise RuleError("Choose a configured national team role.")
+                selected = {country} if country is not None else managed
+                if await con.fetchval(
+                    "SELECT 1 FROM role_operations WHERE guild_id=$1 "
+                    "AND status IN ('pending','failed')",
+                    guild.id,
+                ):
+                    raise RuleError(
+                        "Resolve unfinished role changes with /sync before clearing countries."
+                    )
+                players = {
+                    p["user_id"]: p["current_country_role_id"]
+                    for p in await con.fetch(
+                        "SELECT user_id,current_country_role_id FROM players WHERE guild_id=$1",
+                        guild.id,
+                    )
+                }
+                users = {uid for uid, cid in players.items() if cid in selected}
+                users |= {m.id for m in guild.members if any(r.id in selected for r in m.roles)}
+                operations = []
+                for uid in sorted(users):
+                    await con.execute(
+                        "INSERT INTO players(guild_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+                        guild.id,
+                        uid,
+                    )
+                    current = players.get(uid)
+                    target = current if current not in selected else None
+                    action = "clear_extra" if target else "clear"
+                    opid = await con.fetchval(
+                        "INSERT INTO role_operations(guild_id,cycle_id,user_id,from_country_id,target_country_id,action,actor_id,clear_country_ids) "
+                        "VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+                        guild.id,
+                        cycle,
+                        uid,
+                        current,
+                        target,
+                        action,
+                        actor,
+                        sorted(selected),
+                    )
+                    operations.append(opid)
+                await self.audit(
+                    con,
+                    guild.id,
+                    "country clear started",
+                    actor,
+                    countries=sorted(selected),
+                    players=len(users),
+                )
+            success = 0
+            for opid in operations:
+                success += await self.execute_operation(con, guild, opid)
+            await self.audit(
+                con,
+                guild.id,
+                "country clear finished",
+                actor,
+                countries=sorted(selected),
+                successful=success,
+                failed=len(operations) - success,
+            )
+            return success, len(operations) - success
+
+    async def start_reset(self, guild, actor, expected_cycle=None):
+        async with self.db.guild(guild.id) as con:
+            async with con.transaction():
+                cfg = await self.config(con, guild.id)
+                if expected_cycle is not None and await self.cycle(con, guild.id) != expected_cycle:
+                    raise RuleError("The draft cycle changed. Reopen /reset.")
+                if await con.fetchval(
+                    "SELECT 1 FROM role_operations WHERE guild_id=$1 AND status IN ('pending','failed')",
+                    guild.id,
+                ):
+                    raise RuleError(
+                        "Resolve unfinished role operations with /sync before resetting."
+                    )
+                managed = await self.role_ids(con, guild.id, "country")
+                users = {
+                    r["user_id"]
+                    for r in await con.fetch(
+                        "SELECT user_id FROM players WHERE guild_id=$1 AND current_country_role_id IS NOT NULL",
+                        guild.id,
+                    )
+                }
+                users |= {
+                    m.id
+                    for m in guild.members
+                    if any(r.id in managed or r.id == cfg["respin_role_id"] for r in m.roles)
+                }
+                for uid in users:
+                    await self.prepare_operation(con, guild, uid, None, "reset", actor)
+                await con.execute(
+                    "UPDATE guild_config SET resetting=TRUE WHERE guild_id=$1", guild.id
+                )
+                await con.execute(
+                    "UPDATE draft_cycles SET status='resetting' WHERE guild_id=$1 AND status='active'",
+                    guild.id,
+                )
+                await con.execute(
+                    "UPDATE waitlist_entries SET status='removed',reservation_active=FALSE WHERE guild_id=$1 AND status <> 'completed'",
+                    guild.id,
+                )
+                await self.audit(
+                    con,
+                    guild.id,
+                    "reset started",
+                    actor,
+                    players=len(users),
+                    opt_in=cfg["opt_in_role_id"],
+                )
+            await self.recover_locked(con, guild)
+            return not await con.fetchval(
+                "SELECT resetting FROM guild_config WHERE guild_id=$1", guild.id
+            )
+
+    async def finish_reset(self, con, guild):
+        cfg = await self.config(con, guild.id, allow_reset=True)
+        if not cfg["resetting"]:
+            return
+        if await con.fetchval(
+            "SELECT 1 FROM role_operations WHERE guild_id=$1 AND action='reset' AND status <> 'completed'",
+            guild.id,
+        ):
+            return
+        async with con.transaction():
+            await con.execute(
+                "UPDATE draft_cycles SET status='closed',completed_at=now() WHERE guild_id=$1 AND status='resetting'",
+                guild.id,
+            )
+            await con.execute("INSERT INTO draft_cycles(guild_id) VALUES($1)", guild.id)
+            await con.execute("DELETE FROM cycle_exclusions WHERE guild_id=$1", guild.id)
+            await con.execute("UPDATE guild_config SET resetting=FALSE WHERE guild_id=$1", guild.id)
+            for member in guild.members:
+                if not member.bot and any(r.id == cfg["opt_in_role_id"] for r in member.roles):
+                    await self.enqueue(con, member, "opt_in")
+            await self.audit(con, guild.id, "reset completed")
+
+    async def recover_locked(self, con, guild):
+        ops = await con.fetch(
+            "SELECT id FROM role_operations WHERE guild_id=$1 AND status IN ('pending','failed') ORDER BY id",
+            guild.id,
+        )
+        for op in ops:
+            await self.execute_operation(con, guild, op["id"])
+        await self.finish_batches(con, guild)
+        await self.finish_reset(con, guild)
+
+    async def recover(self, guild):
+        async with self.db.guild(guild.id) as con:
+            if await con.fetchval("SELECT 1 FROM guild_config WHERE guild_id=$1", guild.id):
+                await self.recover_locked(con, guild)
+
+    async def member_update(self, before, after):
+        async with self.db.guild(after.guild.id) as con:
+            cfg = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", after.guild.id)
+            if not cfg or cfg["resetting"] or after.bot:
+                return
+            old, new = {r.id for r in before.roles}, {r.id for r in after.roles}
+            if old == new:
+                return
+            async with con.transaction():
+                clubs = await self.role_ids(con, after.guild.id, "club")
+                known = await con.fetchval(
+                    "SELECT 1 FROM players WHERE guild_id=$1 AND user_id=$2",
+                    after.guild.id,
+                    after.id,
+                )
+                position_ids = set(await self.position_mapping(con, after.guild.id))
+                club_changed = old & clubs != new & clubs
+                positions_changed = old & position_ids != new & position_ids
+                if (club_changed or positions_changed) and known:
+                    await self.refresh_player(con, after)
+                    await self.reconcile_waitlist(con, after.guild)
+                    await self.flag_capacity(con, after.guild.id)
+                    await self.audit(
+                        con,
+                        after.guild.id,
+                        "club roles changed" if club_changed else "position roles changed",
+                        user=after.id,
+                    )
+                if cfg["opt_in_role_id"] in new - old:
+                    try:
+                        await self.enqueue(con, after, "opt_in")
+                    except RuleError:
+                        pass  # Already assigned/waitlisted; opt-in is idempotent.
+                managed = await self.role_ids(con, after.guild.id, "country")
+                if (old & managed) != (new & managed):
+                    active_op = await con.fetchval(
+                        "SELECT 1 FROM role_operations WHERE guild_id=$1 AND user_id=$2 "
+                        "AND status IN ('pending','failed')",
+                        after.guild.id,
+                        after.id,
+                    )
+                    saved = await con.fetchval(
+                        "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
+                        after.guild.id,
+                        after.id,
+                    )
+                    if not active_op and new & managed != ({saved} if saved else set()):
+                        await self.audit(
+                            con,
+                            after.guild.id,
+                            "country role discrepancy",
+                            user=after.id,
+                            expected=saved,
+                            actual=sorted(new & managed),
+                        )
+
+    async def member_left(self, member):
+        async with self.db.guild(member.guild.id) as con:
+            async with con.transaction():
+                await con.execute(
+                    "UPDATE players SET present=FALSE WHERE guild_id=$1 AND user_id=$2",
+                    member.guild.id,
+                    member.id,
+                )
+                await con.execute(
+                    "UPDATE waitlist_entries SET status='absent',reservation_active=FALSE,"
+                    "proposed_country_role_id=NULL,updated_at=now() WHERE guild_id=$1 AND user_id=$2 "
+                    "AND status IN ('pending','blocked','unassigned')",
+                    member.guild.id,
+                    member.id,
+                )
+
+    async def member_joined(self, member):
+        async with self.db.guild(member.guild.id) as con:
+            cfg = await con.fetchrow(
+                "SELECT * FROM guild_config WHERE guild_id=$1", member.guild.id
+            )
+            if not cfg or cfg["resetting"] or member.bot:
+                return
+            await self.refresh_player(con, member)
+            op = await con.fetchval(
+                "SELECT id FROM role_operations WHERE guild_id=$1 AND user_id=$2 AND status IN ('pending','failed')",
+                member.guild.id,
+                member.id,
+            )
+            if op:
+                await self.execute_operation(con, member.guild, op)
+                return
+            saved = await con.fetchval(
+                "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
+                member.guild.id,
+                member.id,
+            )
+            if saved:
+                # Returning members alone receive automatic restoration, never ordinary updates.
+                async with con.transaction():
+                    opid = await con.fetchval(
+                        "INSERT INTO role_operations(guild_id,cycle_id,user_id,from_country_id,target_country_id,action) "
+                        "VALUES($1,$2,$3,$4,$4,'restore') RETURNING id",
+                        member.guild.id,
+                        await self.cycle(con, member.guild.id),
+                        member.id,
+                        saved,
+                    )
+                await self.execute_operation(con, member.guild, opid)
+            else:
+                existing = await con.fetchval(
+                    "SELECT 1 FROM waitlist_entries WHERE guild_id=$1 AND user_id=$2 AND status='absent'",
+                    member.guild.id,
+                    member.id,
+                )
+                if existing or any(r.id == cfg["opt_in_role_id"] for r in member.roles):
+                    async with con.transaction():
+                        await self.enqueue(con, member, "opt_in", refresh=True)
+
+    async def flush_outbox(self, guild):
+        async with self.db.guild(guild.id) as con:
+            rows = await con.fetch(
+                "SELECT * FROM announcement_outbox WHERE guild_id=$1 AND status='pending' ORDER BY id LIMIT 50",
+                guild.id,
+            )
+            for row in rows:
+                try:
+                    channel = guild.get_channel(row["channel_id"]) or await self.bot.fetch_channel(
+                        row["channel_id"]
+                    )
+                    public = row["dedupe_key"].startswith(("operation:", "batch:"))
+                    message = await channel.send(
+                        row["payload"],
+                        allowed_mentions=discord.AllowedMentions(
+                            everyone=False, users=public, roles=public, replied_user=False
+                        ),
+                    )
+                    await con.execute(
+                        "UPDATE announcement_outbox SET status='sent',discord_message_id=$2,sent_at=now(),"
+                        "attempts=attempts+1,last_error=NULL WHERE id=$1",
+                        row["id"],
+                        message.id,
+                    )
+                except discord.HTTPException as exc:
+                    await con.execute(
+                        "UPDATE announcement_outbox SET attempts=attempts+1,last_error=$2 WHERE id=$1",
+                        row["id"],
+                        str(exc)[:1000],
+                    )
+                    log.warning("Outbox delivery failed for guild %s item %s", guild.id, row["id"])
+
+    async def cleanup_assignment_roles(self, con, guild, member, player, cfg):
+        target = player["current_country_role_id"]
+        if not target:
+            return
+        held = {r.id for r in member.roles}
+        needs_marker = player["has_respun"] and cfg["respin_role_id"] not in held
+        if cfg["opt_in_role_id"] not in held and not needs_marker:
+            return
+        if await con.fetchval(
+            "SELECT 1 FROM role_operations WHERE guild_id=$1 AND user_id=$2 "
+            "AND status IN ('pending','failed')",
+            guild.id,
+            member.id,
+        ):
+            return
+        # Called only when country roles match the saved assignment. Never restores
+        # a country that staff manually removed while the player remained present.
+        async with con.transaction():
+            opid = await con.fetchval(
+                "INSERT INTO role_operations(guild_id,cycle_id,user_id,from_country_id,target_country_id,action) "
+                "VALUES($1,$2,$3,$4,$4,'role_cleanup') RETURNING id",
+                guild.id,
+                await self.cycle(con, guild.id),
+                member.id,
+                target,
+            )
+        await self.execute_operation(con, guild, opid)
+
+    async def sync(self, guild, actor=None):
+        await self.recover(guild)
+        issues = []
+        async with self.db.guild(guild.id) as con:
+            cfg = await self.config(con, guild.id, allow_reset=True)
+            managed = await self.role_ids(con, guild.id, "country")
+            for rid in managed:
+                try:
+                    validate_role(guild, guild.get_role(rid))
+                except RuleError as exc:
+                    issues.append(f"<@&{rid}>: {exc}")
+            for key in ("callups_channel_id", "logs_channel_id"):
+                ch = guild.get_channel(cfg[key])
+                if not ch or not ch.permissions_for(guild.me).send_messages:
+                    issues.append(f"{key}: missing channel or Send Messages permission.")
+            players = {
+                p["user_id"]: p
+                for p in await con.fetch("SELECT * FROM players WHERE guild_id=$1", guild.id)
+            }
+            for member in guild.members:
+                if member.id in players:
+                    await self.refresh_player(con, member)
+                actual = {r.id for r in member.roles} & managed
+                expected = players.get(member.id, {}).get("current_country_role_id")
+                if actual != ({expected} if expected else set()):
+                    issues.append(
+                        f"<@{member.id}>: saved {f'<@&{expected}>' if expected else 'none'}; roles {', '.join(f'<@&{rid}>' for rid in sorted(actual)) or 'none'}"
+                    )
+                elif not cfg["resetting"] and member.id in players:
+                    await self.cleanup_assignment_roles(con, guild, member, players[member.id], cfg)
+            for uid in players:
+                if not guild.get_member(uid):
+                    await con.execute(
+                        "UPDATE players SET present=FALSE WHERE guild_id=$1 AND user_id=$2",
+                        guild.id,
+                        uid,
+                    )
+                    await con.execute(
+                        "UPDATE waitlist_entries SET status='absent',reservation_active=FALSE WHERE guild_id=$1 AND user_id=$2 AND status IN ('pending','blocked','unassigned')",
+                        guild.id,
+                        uid,
+                    )
+            if not cfg["resetting"]:
+                async with con.transaction():
+                    await self.reconcile_waitlist(con, guild)
+                    for member in guild.members:
+                        if member.bot or not any(
+                            r.id == cfg["opt_in_role_id"] for r in member.roles
+                        ):
+                            continue
+                        if member.id not in players:
+                            await self.enqueue(con, member, "opt_in")
+            pop, clubs = await self.counts(con, guild.id)
+            for (country, club), count in clubs.items():
+                if count > cfg["club_limit"]:
+                    issues.append(
+                        f"<@&{country}> / <@&{club}>: {count}/{cfg['club_limit']} seats (including reservations)."
+                    )
+            for p in await con.fetch(
+                "SELECT user_id FROM players WHERE guild_id=$1 AND club_conflict", guild.id
+            ):
+                issues.append(f"<@{p['user_id']}>: primary club requires staff selection.")
+            failures = await con.fetch(
+                "SELECT id,user_id,last_error FROM role_operations WHERE guild_id=$1 AND status='failed'",
+                guild.id,
+            )
+            issues.extend(f"<@{r['user_id']}>: {r['last_error']}" for r in failures)
+            await self.audit(
+                con,
+                guild.id,
+                "synchronization reviewed",
+                actor,
+                issue_count=len(issues),
+                issues=issues[:20],
+            )
+        return issues

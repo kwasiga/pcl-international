@@ -1,0 +1,19 @@
+[project]
+name = "pcl-international"
+version = "1.0.0"
+description = "PCL International Discord national team draft management"
+requires-python = ">=3.12"
+dependencies = ["discord.py>=2.6,<3", "asyncpg>=0.30,<1", "python-dotenv>=1,<2"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.11"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "ASYNC"]
