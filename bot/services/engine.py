@@ -17,6 +17,7 @@ from bot.services.rules import (
     POSITION_GROUPS,
     player_positions,
     position_occupancy,
+    SETUP_LABELS,
 )
 
 log = logging.getLogger(__name__)
@@ -26,12 +27,15 @@ class Engine:
     def __init__(self, db, bot):
         self.db, self.bot = db, bot
 
-    async def config(self, con, gid, *, allow_reset=False):
+    async def config(self, con, gid, *, allow_reset=False, required=()):
         cfg = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", gid)
         if not cfg:
             raise RuleError("An Administrator must run /setup first.")
         if cfg["resetting"] and not allow_reset:
             raise RuleError("A reset is in progress. Use /status or /sync to inspect recovery.")
+        missing = [SETUP_LABELS.get(key, key) for key in required if not cfg[key]]
+        if missing:
+            raise RuleError("Finish these settings in /setup first: " + ", ".join(missing) + ".")
         return cfg
 
     async def cycle(self, con, gid):
@@ -60,7 +64,7 @@ class Engine:
             json.dumps(details),
         )
         cfg = await con.fetchrow("SELECT logs_channel_id FROM guild_config WHERE guild_id=$1", gid)
-        if cfg:
+        if cfg and cfg["logs_channel_id"]:
             for index, body in enumerate(audit_messages(action, actor, user, details)):
                 key = f"audit:{audit_id}" if index == 0 else f"audit:{audit_id}:part:{index}"
                 await self.outbox(con, gid, key, cfg["logs_channel_id"], body)
@@ -326,8 +330,6 @@ class Engine:
             raise RuleError(
                 "Position roles must be separate from country, club, staff and opt-in roles."
             )
-        if not countries or not values.get("staff_role_id") or not values.get("opt_in_role_id"):
-            raise RuleError("Select a staff role, opt-in role, and at least one country.")
         if values["club_limit"] < 1:
             raise RuleError("Club limit must be positive.")
         for role_id in countries:
@@ -335,14 +337,19 @@ class Engine:
         if countries & clubs or values["opt_in_role_id"] in countries | clubs:
             raise RuleError("Country, club and opt-in roles must be separate.")
         for key in ("staff_role_id", "opt_in_role_id"):
+            if not values.get(key):
+                continue
             role = guild.get_role(values[key])
             if not role or role.is_default():
                 raise RuleError("Select an existing role other than @everyone.")
-        validate_role(guild, guild.get_role(values["opt_in_role_id"]))
+        if values.get("opt_in_role_id"):
+            validate_role(guild, guild.get_role(values["opt_in_role_id"]))
         for cid in clubs:
             if not guild.get_role(cid) or guild.get_role(cid).is_default():
                 raise RuleError("A selected club role no longer exists.")
         for key in ("callups_channel_id", "logs_channel_id"):
+            if not values.get(key):
+                continue
             channel = guild.get_channel(values.get(key))
             if not isinstance(channel, discord.TextChannel):
                 raise RuleError("Select text channels for call-ups and staff logs.")
@@ -354,10 +361,18 @@ class Engine:
         async with self.db.guild(guild.id) as con:
             async with con.transaction():
                 old = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", guild.id)
-                if old and old["respin_role_id"] in countries | clubs | set(position_roles) | {
-                    values["opt_in_role_id"],
-                    values["staff_role_id"],
-                }:
+                if (
+                    old
+                    and old["respin_role_id"] is not None
+                    and old["respin_role_id"]
+                    in countries
+                    | clubs
+                    | set(position_roles)
+                    | {
+                        values["opt_in_role_id"],
+                        values["staff_role_id"],
+                    }
+                ):
                     raise RuleError(
                         "The bot's Respun marker must stay separate from country, club, staff and opt-in roles."
                     )
@@ -457,7 +472,12 @@ class Engine:
         self, con, guild, uid, target, action, actor, *, override=False, batch=None
     ):
         gid = guild.id
-        cfg = await self.config(con, gid, allow_reset=action == "reset")
+        cfg = await self.config(
+            con,
+            gid,
+            allow_reset=action == "reset",
+            required=("callups_channel_id",) if target else (),
+        )
         await self.idle_player(con, gid, uid)
         member = guild.get_member(uid)
         if member:
@@ -840,7 +860,7 @@ class Engine:
     async def draft(self, guild, actor):
         async with self.db.guild(guild.id) as con:
             async with con.transaction():
-                await self.config(con, guild.id)
+                await self.config(con, guild.id, required=("callups_channel_id",))
                 if await con.fetchval(
                     "SELECT 1 FROM draft_batches WHERE guild_id=$1 AND status='processing'",
                     guild.id,
@@ -899,6 +919,8 @@ class Engine:
             )
             if completed:
                 cfg = await self.config(con, guild.id, allow_reset=True)
+                if not cfg["callups_channel_id"]:
+                    continue
                 grouped = defaultdict(list)
                 for row in completed:
                     grouped[row["target_country_id"]].append(row["user_id"])

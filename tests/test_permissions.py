@@ -84,3 +84,10 @@ class PermissionsTests(unittest.IsolatedAsyncioTestCase):
     async def test_dms_denied(self):
         with self.assertRaises(RuleError):
             await require_staff(self.db, SimpleNamespace(id=10))
+
+    async def test_partial_setup_without_admin_role_preserves_bootstrap_access(self):
+        self.con.fetchrow.return_value = {"staff_role_id": None}
+        await require_staff(self.db, Member(uid=99), admin=True)
+        await require_staff(self.db, Member(admin=True), admin=True)
+        with self.assertRaises(RuleError):
+            await require_staff(self.db, Member(8))

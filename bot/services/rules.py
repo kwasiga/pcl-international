@@ -99,3 +99,18 @@ def callup_chunks(grouped, limit=1900, *, country_names=None):
     if text != title:
         chunks.append(text)
     return chunks
+
+
+SETUP_LABELS = {
+    "staff_role_id": "admin role",
+    "opt_in_role_id": "opt-in role",
+    "callups_channel_id": "call-ups channel",
+    "logs_channel_id": "staff logs channel",
+}
+
+
+def missing_setup(values):
+    missing = [label for key, label in SETUP_LABELS.items() if not values.get(key)]
+    if not values.get("countries"):
+        missing.append("country roles")
+    return missing

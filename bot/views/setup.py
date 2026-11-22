@@ -1,7 +1,7 @@
 import discord
 
 from bot.services.permissions import require_staff
-from bot.services.rules import POSITION_GROUPS, RuleError
+from bot.services.rules import POSITION_GROUPS, RuleError, missing_setup
 from bot.views.common import StaffView, reply_error
 
 
@@ -59,7 +59,7 @@ class SetupPanel(StaffView):
 
         e = discord.Embed(title="PCL International — Setup", color=0x2689D9)
         e.description = (
-            "Choose a section. Changes apply only when you press Save.\n"
+            "Save any section now and return later to finish setup.\n"
             "Add or remove countries/clubs in batches of up to 25; repeat as needed."
         )
         e.add_field(
@@ -135,8 +135,14 @@ class SetupPanel(StaffView):
                 await self.guild.chunk()
             await self.engine.save_config(self.guild, self.values, i.user.id, self.revision)
             self.stop()
+            missing = missing_setup(self.values)
+            message = "Settings saved. You can reopen /setup to continue."
+            if missing:
+                message += " Still unconfigured: " + ", ".join(missing) + "."
+            else:
+                message += " Use /waitlist view to review the draft."
             await i.edit_original_response(
-                content="PCL International is configured. Existing opt-ins were scanned. Use /waitlist view to review the draft.",
+                content=message,
                 embed=None,
                 view=None,
             )

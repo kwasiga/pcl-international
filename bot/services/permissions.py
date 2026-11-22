@@ -11,7 +11,7 @@ async def require_staff(db, member, *, admin=False):
         config = await con.fetchrow(
             "SELECT staff_role_id FROM guild_config WHERE guild_id=$1", member.guild.id
         )
-    if config is None:
+    if config is None or config["staff_role_id"] is None:
         # Bootstrap only: no role has been designated yet. Once configured, neither
         # server ownership nor Discord Administrator bypasses the configured role.
         if admin and (member.id == member.guild.owner_id or member.guild_permissions.administrator):
