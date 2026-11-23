@@ -1,4 +1,5 @@
 import unittest
+import re
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -143,6 +144,54 @@ class GoalkeeperCommandTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuleError, "inside your Discord server"):
             await self.cog.goalkeepers.callback(self.cog, self.i)
         self.engine.config.assert_not_awaited()
+
+    async def test_country_pages_are_limited_to_eight_and_preserve_all_countries(self):
+        for rid in range(100, 119):
+            self.guild.role_map[rid] = Role(rid)
+        self.engine.role_ids.return_value = set(range(100, 119))
+        await self.cog.goalkeepers.callback(self.cog, self.i)
+        view = Pages(
+            None,
+            77,
+            "Goalkeepers",
+            self.cog.pages.call_args.args[2],
+            **self.cog.pages.call_args.kwargs,
+        )
+        country_counts = [len(re.findall(r"\*\*<@&\d+>\*\*", page)) for page in view.pages]
+        self.assertEqual(country_counts, [8, 8, 3, 0])
+        self.assertIn("Unassigned goalkeepers", view.pages[-1])
+        for rid in range(100, 119):
+            self.assertEqual("\n".join(view.pages).count(f"**<@&{rid}>**"), 1)
+
+    async def test_unassigned_gks_are_on_separate_pages_with_eight_players_each(self):
+        for uid in range(100, 119):
+            self.guild.player(uid, (30,))
+        await self.cog.goalkeepers.callback(self.cog, self.i)
+        view = Pages(
+            None,
+            77,
+            "Goalkeepers",
+            self.cog.pages.call_args.args[2],
+            **self.cog.pages.call_args.kwargs,
+        )
+        self.assertNotIn("Unassigned goalkeepers", view.pages[0])
+        self.assertEqual([len(re.findall(r"<@\d+>", p)) for p in view.pages[1:]], [8, 8, 3])
+        for page in view.pages[1:]:
+            self.assertIn("Unassigned goalkeepers", page)
+
+    async def test_unassigned_only_report_does_not_create_an_empty_first_page(self):
+        self.engine.role_ids.return_value = set()
+        self.guild.player(100, (30,))
+        await self.cog.goalkeepers.callback(self.cog, self.i)
+        view = Pages(
+            None,
+            77,
+            "Goalkeepers",
+            self.cog.pages.call_args.args[2],
+            **self.cog.pages.call_args.kwargs,
+        )
+        self.assertEqual(len(view.pages), 1)
+        self.assertIn("<@100>", view.pages[0])
 
 
 class GoalkeeperSetupTests(unittest.IsolatedAsyncioTestCase):

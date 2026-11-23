@@ -127,16 +127,17 @@ class Confirmation(StaffView):
 
 
 class Pages(StaffView):
-    def __init__(self, db, owner, title, lines, *, staff_only=True, footer=None):
+    def __init__(self, db, owner, title, lines, *, staff_only=True, footer=None, page_breaks=()):
         super().__init__(db, owner)
         self.staff_only = staff_only
         self.footer = footer
         self.title, self.index = title, 0
         self.pages = []
         page = ""
-        for line in lines or ["No records."]:
+        page_breaks = set(page_breaks)
+        for index, line in enumerate(lines or ["No records."]):
             line = str(line)[:1800]
-            if len(page) + len(line) + 1 > 3500:
+            if page and (index in page_breaks or len(page) + len(line) + 1 > 3500):
                 self.pages.append(page)
                 page = ""
             page += line + "\n"

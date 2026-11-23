@@ -35,8 +35,16 @@ class StaffCommands(commands.Cog):
         await i.response.defer(ephemeral=True)
         await require_staff(self.db, i.user, admin=admin)
 
-    async def pages(self, i, title, lines, *, staff_only=True, footer=None):
-        view = Pages(self.db, i.user.id, title, lines, staff_only=staff_only, footer=footer)
+    async def pages(self, i, title, lines, *, staff_only=True, footer=None, page_breaks=()):
+        view = Pages(
+            self.db,
+            i.user.id,
+            title,
+            lines,
+            staff_only=staff_only,
+            footer=footer,
+            page_breaks=page_breaks,
+        )
         await i.followup.send(embed=view.embed(), view=view, ephemeral=True)
         view.message = await i.original_response()
 
@@ -340,8 +348,13 @@ class StaffCommands(commands.Cog):
         members = i.guild.members if i.guild.chunked else await i.guild.chunk()
         grouped, unassigned = goalkeeper_groups(members, goalkeeper, managed | enabled)
         lines = [f"**International GK role:** <@&{goalkeeper}>"]
+        page_breaks = set()
+        country_count = 0
         countries = [role for rid in enabled if (role := i.guild.get_role(rid)) is not None]
         for role in sorted(countries, key=lambda r: (r.name.casefold(), r.id)):
+            if country_count and country_count % 8 == 0:
+                page_breaks.add(len(lines))
+            country_count += 1
             lines.append(f"\n**<@&{role.id}>**")
             lines.extend(f"<@{uid}>" for uid in grouped[role.id])
             if not grouped[role.id]:
@@ -353,10 +366,19 @@ class StaffCommands(commands.Cog):
             if grouped[rid] and (role := i.guild.get_role(rid)) is not None
         ]
         for role in sorted(inactive, key=lambda r: (r.name.casefold(), r.id)):
+            if country_count and country_count % 8 == 0:
+                page_breaks.add(len(lines))
+            country_count += 1
             lines.append(f"\n**<@&{role.id}> — disabled country**")
             lines.extend(f"<@{uid}>" for uid in grouped[role.id])
+        if country_count:
+            page_breaks.add(len(lines))
         lines.append("\n**Unassigned goalkeepers**")
-        lines.extend(f"<@{uid}>" for uid in unassigned)
+        for index, uid in enumerate(unassigned):
+            if index and index % 8 == 0:
+                page_breaks.add(len(lines))
+                lines.append("\n**Unassigned goalkeepers — continued**")
+            lines.append(f"<@{uid}>")
         if not unassigned:
             lines.append("None")
         total = len(set(unassigned).union(*(set(players) for players in grouped.values())))
@@ -366,6 +388,7 @@ class StaffCommands(commands.Cog):
             lines,
             staff_only=False,
             footer=f"International GKs: {total} • Unassigned: {len(unassigned)}",
+            page_breaks=page_breaks,
         )
 
     @app_commands.command(description="View your transfer history; staff may look up other players")
