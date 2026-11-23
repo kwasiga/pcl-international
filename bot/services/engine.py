@@ -750,9 +750,9 @@ class Engine:
             if target:
                 cfg = await self.config(con, gid, allow_reset=True)
                 old = op["from_country_id"]
-                if old and old != target:
-                    verb = "reassigned" if op["action"].startswith("respin") else "transferred"
-                    body = f"**<@{uid}> has been {verb} from <@&{old}> to <@&{target}>!**"
+                if old:
+                    previous = f" from <@&{old}>" if old != target else ""
+                    body = f"**<@{uid}> has been reassigned{previous} to <@&{target}>!**"
                 else:
                     body = f"**<@{uid}> has been assigned to <@&{target}>!**"
                 await self.outbox(con, gid, f"operation:{opid}", cfg["callups_channel_id"], body)

@@ -81,3 +81,39 @@ class DraftAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         engine.outbox.assert_awaited_once_with(
             con, 50001, "operation:42", 30, "**<@100> has been assigned to <@&1>!**"
         )
+
+    @patch("bot.services.engine.apply_roles", new_callable=AsyncMock)
+    async def test_existing_country_uses_same_reassignment_message_for_every_action(self, apply):
+        for action in ("draft", "manual", "respin", "respin_exception"):
+            with self.subTest(action=action):
+                engine, con = self.make_engine()
+                con.fetchrow.return_value.update(
+                    action=action, from_country_id=2, batch_id=5 if action == "draft" else None
+                )
+                engine.ensure_respin_role = AsyncMock(return_value=30)
+                self.assertTrue(await engine.execute_operation(con, Guild(), 42))
+                engine.outbox.assert_awaited_once_with(
+                    con,
+                    50001,
+                    "operation:42",
+                    30,
+                    "**<@100> has been reassigned from <@&2> to <@&1>!**",
+                )
+
+    @patch("bot.services.engine.apply_roles", new_callable=AsyncMock)
+    async def test_manual_assignment_without_country_uses_assigned_message(self, apply):
+        engine, con = self.make_engine()
+        con.fetchrow.return_value.update(action="manual", batch_id=None)
+        self.assertTrue(await engine.execute_operation(con, Guild(), 42))
+        engine.outbox.assert_awaited_once_with(
+            con, 50001, "operation:42", 30, "**<@100> has been assigned to <@&1>!**"
+        )
+
+    @patch("bot.services.engine.apply_roles", new_callable=AsyncMock)
+    async def test_same_country_reconciliation_still_counts_as_reassignment(self, apply):
+        engine, con = self.make_engine()
+        con.fetchrow.return_value.update(action="manual", from_country_id=1, batch_id=None)
+        self.assertTrue(await engine.execute_operation(con, Guild(), 42))
+        engine.outbox.assert_awaited_once_with(
+            con, 50001, "operation:42", 30, "**<@100> has been reassigned to <@&1>!**"
+        )
