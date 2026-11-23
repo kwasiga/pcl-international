@@ -4,7 +4,7 @@ from bot.services.rules import RuleError
 
 
 async def require_staff(db, member, *, admin=False):
-    """Configured role hierarchy gates every command and component interaction."""
+    """Configured role hierarchy gates staff commands and their components."""
     if not isinstance(member, discord.Member):
         raise RuleError("Use this command inside your Discord server.")
     async with db.pool.acquire() as con:

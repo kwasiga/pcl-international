@@ -127,8 +127,9 @@ class Confirmation(StaffView):
 
 
 class Pages(StaffView):
-    def __init__(self, db, owner, title, lines):
+    def __init__(self, db, owner, title, lines, *, staff_only=True):
         super().__init__(db, owner)
+        self.staff_only = staff_only
         self.title, self.index = title, 0
         self.pages = []
         page = ""
@@ -139,6 +140,16 @@ class Pages(StaffView):
                 page = ""
             page += line + "\n"
         self.pages.append(page)
+
+    async def interaction_check(self, interaction):
+        if self.staff_only:
+            return await super().interaction_check(interaction)
+        if interaction.user.id != self.owner:
+            await reply_error(
+                interaction, RuleError("Only the member who opened this roster can use its pages.")
+            )
+            return False
+        return True
 
     def embed(self):
         e = discord.Embed(title=self.title, description=self.pages[self.index], color=0x2689D9)

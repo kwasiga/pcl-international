@@ -34,8 +34,8 @@ class StaffCommands(commands.Cog):
         await i.response.defer(ephemeral=True)
         await require_staff(self.db, i.user, admin=admin)
 
-    async def pages(self, i, title, lines):
-        view = Pages(self.db, i.user.id, title, lines)
+    async def pages(self, i, title, lines, *, staff_only=True):
+        view = Pages(self.db, i.user.id, title, lines, staff_only=staff_only)
         await i.followup.send(embed=view.embed(), view=view, ephemeral=True)
         view.message = await i.original_response()
 
@@ -261,17 +261,28 @@ class StaffCommands(commands.Cog):
 
     @app_commands.command(description="View a country’s active roster grouped by primary club")
     @app_commands.guild_only()
-    async def roster(self, i: discord.Interaction, country: discord.Role):
-        await self.check(i)
+    @app_commands.describe(country="Choose a national team configured in /setup")
+    async def roster(self, i: discord.Interaction, country: str):
+        await i.response.defer(ephemeral=True)
+        if i.guild is None:
+            raise RuleError("Use this command inside your Discord server.")
+        try:
+            country_id = int(country)
+        except ValueError:
+            raise RuleError("Choose a country from the configured national team list.") from None
         async with self.db.pool.acquire() as con:
+            # Validate again at execution: typed values and outdated autocomplete
+            # selections must never expose a roster outside this server's country list.
+            configured = await self.engine.role_ids(con, i.guild_id, "country", True)
+            role = i.guild.get_role(country_id)
+            if country_id not in configured or role is None:
+                raise RuleError("Choose a country from the configured national team list.")
             cfg = await self.engine.config(con, i.guild_id, allow_reset=True)
-            if country.id not in await self.engine.role_ids(con, i.guild_id, "country"):
-                raise RuleError("Choose a configured national team role.")
             rows = await con.fetch(
                 "SELECT user_id,primary_club_role_id,club_conflict,present,position_groups FROM players "
                 "WHERE guild_id=$1 AND current_country_role_id=$2 ORDER BY primary_club_role_id NULLS LAST,user_id",
                 i.guild_id,
-                country.id,
+                country_id,
             )
         groups = defaultdict(list)
         for r in rows:
@@ -293,7 +304,24 @@ class StaffCommands(commands.Cog):
                 + (" — club conflict" if p["club_conflict"] else "")
                 for p in players
             )
-        await self.pages(i, f"{country.name} — Active roster", lines)
+        await self.pages(i, f"{role.name} — Active roster", lines, staff_only=False)
+
+    @roster.autocomplete("country")
+    async def roster_countries(self, i: discord.Interaction, current: str):
+        if i.guild is None:
+            return []
+        async with self.db.pool.acquire() as con:
+            configured = await self.engine.role_ids(con, i.guild_id, "country", True)
+        query = current.strip().casefold()
+        roles = [
+            role
+            for rid in configured
+            if (role := i.guild.get_role(rid)) is not None and query in role.name.casefold()
+        ]
+        return [
+            app_commands.Choice(name=role.name[:100], value=str(role.id))
+            for role in sorted(roles, key=lambda r: (r.name.casefold(), r.id))[:25]
+        ]
 
     @app_commands.command(description="View permanent national assignment history")
     @app_commands.guild_only()

@@ -171,5 +171,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual({o["name"] for o in data["options"]}, {"run", "country"})
                     reveal = next(o for o in data["options"] if o["name"] == "country")
                     self.assertFalse(reveal["options"][0]["required"])
+                elif command.name == "roster":
+                    self.assertEqual(data["options"][0]["type"], 3)
+                    self.assertTrue(data["options"][0]["autocomplete"])
         finally:
             await bot.close()

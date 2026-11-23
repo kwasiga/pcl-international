@@ -48,9 +48,9 @@ Use a direct database URL. The engine holds PostgreSQL session advisory locks ac
 4. Invite using the `bot` and `applications.commands` scopes. Required permissions: **Manage Roles**, **View Channels**, **Send Messages**, and **Read Message History**. Bot Administrator permission is unnecessary.
 5. Place the bot's highest role above every national team role and the opt-in role it will manage. National roles must be ordinary existing roles, not integration-managed roles.
 6. Enable Discord Developer Mode to copy the application ID and test server ID. Set `TEST_GUILD_ID` for initial testing.
-7. Start the bot, then run `/setup` as the server owner or a Discord Administrator for initial setup. Once configured, the designated admin role or a higher role is required for every command.
+7. Start the bot, then run `/setup` as the server owner or a Discord Administrator for initial setup. Once configured, the designated admin role or a higher role is required for staff commands. `/roster` is available to every server member.
 
-Every command, including `/setup` and `/reset`, enforces the designated admin role and Discord role hierarchy at execution time. Discord Administrator permission and server ownership do not bypass this rule after initial setup. Slash-command visibility alone does not grant access. All commands and panels are server-only and private to the invoking staff member. Confirmation buttons recheck permissions.
+Staff commands, including `/setup` and `/reset`, enforce the designated admin role and Discord role hierarchy at execution time. Discord Administrator permission and server ownership do not bypass this rule after initial setup. Slash-command visibility alone does not grant access. `/roster` is available to every server member and only accepts enabled country roles selected in `/setup`; its autocomplete lists those countries, and execution revalidates the selection. All commands and panels are server-only and private to the invoking member. Confirmation buttons recheck staff permissions.
 
 ## Setup panel
 
@@ -81,13 +81,13 @@ Press **Save** to keep any partial configuration and return later. Only fields y
 | `/clear [country]` | Staff | Confirm removal of everyone from one country; omit country to clear all configured countries. Preserves history and the current cycle. |
 | `/remove player` | Staff | Clears country and current-cycle exclusions, preserves history, and does not requeue. |
 | `/club set player club` | Staff | Saves a primary club the player currently holds. |
-| `/roster country` | Staff | Active roster grouped by club; pending reservations excluded. |
+| `/roster country` | Everyone in the server | Active roster grouped by club; pending reservations excluded. Choose from configured enabled countries only. Other roles and disabled/deleted countries are rejected. |
 | `/history player` | Staff | Permanent dated assignment, transfer, removal, reset, and override history. |
 | `/status` | Staff | Current cycle, waitlist states, enabled roles, capacity violations, unfinished operations, and queued messages. |
 | `/sync` | Staff | Retries unfinished operations and reports current role/database discrepancies. |
 | `/reset` | Designated admin role or higher | Explicit confirmation; clears managed country roles and rebuilds from current opt-ins in a new cycle. |
 
-An authorized member has the designated admin role or a higher role in the server hierarchy. This applies to every command and panel, including setup and reset. Discord Administrators and the owner must also meet this minimum once configured. If the designated role is deleted, access is denied. Before initial setup only, the owner or a Discord Administrator may open setup. Other members cannot use these commands or another member's panels.
+An authorized staff member has the designated admin role or a higher role in the server hierarchy. This applies to staff commands and panels, including setup and reset. Discord Administrators and the owner must also meet this minimum once configured. If the designated role is deleted, staff access is denied. Before initial setup only, the owner or a Discord Administrator may open setup. Every member may use `/roster` for configured countries and navigate their own roster pages. Other members cannot use staff commands or another member's panels.
 
 ## Assignment rules
 
