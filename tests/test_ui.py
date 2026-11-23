@@ -178,5 +178,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     override = next(o for o in data["options"] if o["name"] == "override_limit")
                     self.assertEqual(override["type"], 5)
                     self.assertFalse(override["required"])
+                elif command.name == "history":
+                    self.assertEqual(data["options"][0]["name"], "player")
+                    self.assertFalse(data["options"][0]["required"])
         finally:
             await bot.close()

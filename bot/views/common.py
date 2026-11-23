@@ -127,9 +127,10 @@ class Confirmation(StaffView):
 
 
 class Pages(StaffView):
-    def __init__(self, db, owner, title, lines, *, staff_only=True):
+    def __init__(self, db, owner, title, lines, *, staff_only=True, footer=None):
         super().__init__(db, owner)
         self.staff_only = staff_only
+        self.footer = footer
         self.title, self.index = title, 0
         self.pages = []
         page = ""
@@ -146,14 +147,17 @@ class Pages(StaffView):
             return await super().interaction_check(interaction)
         if interaction.user.id != self.owner:
             await reply_error(
-                interaction, RuleError("Only the member who opened this roster can use its pages.")
+                interaction, RuleError("Only the member who opened this panel can use its pages.")
             )
             return False
         return True
 
     def embed(self):
         e = discord.Embed(title=self.title, description=self.pages[self.index], color=0x2689D9)
-        e.set_footer(text=f"PCL International • Page {self.index + 1}/{len(self.pages)}")
+        footer = f"PCL International • Page {self.index + 1}/{len(self.pages)}"
+        if self.footer:
+            footer += f"\n{self.footer}"
+        e.set_footer(text=footer)
         return e
 
     @discord.ui.button(label="Previous")

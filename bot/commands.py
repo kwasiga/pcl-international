@@ -35,8 +35,8 @@ class StaffCommands(commands.Cog):
         await i.response.defer(ephemeral=True)
         await require_staff(self.db, i.user, admin=admin)
 
-    async def pages(self, i, title, lines, *, staff_only=True):
-        view = Pages(self.db, i.user.id, title, lines, staff_only=staff_only)
+    async def pages(self, i, title, lines, *, staff_only=True, footer=None):
+        view = Pages(self.db, i.user.id, title, lines, staff_only=staff_only, footer=footer)
         await i.followup.send(embed=view.embed(), view=view, ephemeral=True)
         view.message = await i.original_response()
 
@@ -331,16 +331,27 @@ class StaffCommands(commands.Cog):
             for role in sorted(roles, key=lambda r: (r.name.casefold(), r.id))[:25]
         ]
 
-    @app_commands.command(description="View permanent national assignment history")
+    @app_commands.command(description="View your transfer history; staff may look up other players")
     @app_commands.guild_only()
-    async def history(self, i: discord.Interaction, player: discord.Member):
-        await self.check(i)
+    @app_commands.describe(
+        player="Leave blank for your own history; other players require admin access"
+    )
+    async def history(self, i: discord.Interaction, player: discord.Member | None = None):
+        await i.response.defer(ephemeral=True)
+        if i.guild is None:
+            raise RuleError("Use this command inside your Discord server.")
+        player = player or i.user
+        staff_only = player.id != i.user.id
+        if staff_only:
+            await require_staff(self.db, i.user)
         async with self.db.pool.acquire() as con:
             rows = await con.fetch(
                 "SELECT * FROM assignment_history WHERE guild_id=$1 AND user_id=$2 ORDER BY id DESC",
                 i.guild_id,
                 player.id,
             )
+            cycle = await self.engine.cycle(con, i.guild_id)
+            used = await self.engine.respins_used(con, i.guild_id, player.id, cycle) if cycle else 0
         lines = []
         for r in rows:
             old = f"<@&{r['from_country_id']}>" if r["from_country_id"] else "None"
@@ -350,7 +361,13 @@ class StaffCommands(commands.Cog):
                 f"<t:{int(r['created_at'].timestamp())}:f> • Cycle {r['cycle_id']} • **{r['action']}**\n{old} → {new} • {actor}"
                 + (f" • {override_name(r['override_type'])} override" if r["override_type"] else "")
             )
-        await self.pages(i, f"{player.display_name} — History", lines)
+        await self.pages(
+            i,
+            f"{player.display_name} — History",
+            lines,
+            staff_only=staff_only,
+            footer=f"Respins remaining: {max(0, RESPIN_LIMIT - used)}/{RESPIN_LIMIT}",
+        )
 
     @app_commands.command(description="View draft statistics and unfinished operations")
     @app_commands.guild_only()
