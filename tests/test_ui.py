@@ -109,5 +109,9 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             for command in bot.tree.get_commands():
                 data = command.to_dict(bot.tree)
                 self.assertTrue(data["description"])
+                if command.name == "draft":
+                    self.assertEqual({o["name"] for o in data["options"]}, {"run", "country"})
+                    reveal = next(o for o in data["options"] if o["name"] == "country")
+                    self.assertFalse(reveal["options"][0]["required"])
         finally:
             await bot.close()

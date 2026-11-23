@@ -180,6 +180,17 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 2
         )
         self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 2)
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM announcement_outbox WHERE dedupe_key LIKE 'batch:%'"
+            ),
+            0,
+        )
+        first, _ = await self.engine.release_country(self.guild, 77)
+        second, _ = await self.engine.release_country(self.guild, 77)
+        self.assertNotEqual(first, second)
+        with self.assertRaises(RuleError):
+            await self.engine.release_country(self.guild, 77)
         await self.engine.flush_outbox(self.guild)
         sent = self.guild.channel.send.await_count
         await self.engine.flush_outbox(self.guild)
@@ -208,6 +219,50 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.fetchval("SELECT status FROM role_operations WHERE id=$1", opid), "completed"
         )
+
+    async def test_country_release_waits_for_full_squad_and_is_serialized(self):
+        async with self.db.pool.acquire() as con:
+            await con.execute("UPDATE country_roles SET enabled=FALSE WHERE role_id=2")
+        good, failed = self.guild.player(100), self.guild.player(101)
+        await self.engine.register(good)
+        await self.engine.register(failed)
+        failed.fail = True
+        self.assertEqual(await self.engine.draft(self.guild, 77), (1, 1))
+        with self.assertRaises(RuleError):
+            await self.engine.release_country(self.guild, 77, 1)
+        failed.fail = False
+        await self.engine.recover(self.guild)
+        results = await asyncio.gather(
+            self.engine.release_country(self.guild, 77, 1),
+            self.engine.release_country(self.guild, 77, 1),
+            return_exceptions=True,
+        )
+        self.assertEqual(results.count((1, 2)), 1)
+        self.assertEqual(sum(isinstance(r, RuleError) for r in results), 1)
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM announcement_outbox WHERE dedupe_key LIKE 'batch:country:%'"
+            ),
+            1,
+        )
+
+    async def test_release_uses_current_roster_and_does_not_replay_old_announcements(self):
+        for uid in (100, 101, 102, 103):
+            await self.engine.register(self.guild.player(uid, ()))
+        self.assertEqual(await self.engine.draft(self.guild, 77), (4, 0))
+        selected, count = await self.engine.release_country(self.guild, 77, 1)
+        self.assertEqual((selected, count), (1, 2))
+        # A process restart still respects durable release markers.
+        restarted = Engine(self.db, self.engine.bot)
+        with self.assertRaises(RuleError):
+            await restarted.release_country(self.guild, 77, 1)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 4)
+        async with self.db.pool.acquire() as con:
+            member = await con.fetchval(
+                "SELECT user_id FROM players WHERE current_country_role_id=2 LIMIT 1"
+            )
+        await self.engine.assign(self.guild.get_member(member), None, 77, action="remove")
+        self.assertEqual(await restarted.release_country(self.guild, 77, 2), (2, 1))
 
     async def test_respin_history_exception_and_remove_clear_exclusions(self):
         member = self.guild.player(100)

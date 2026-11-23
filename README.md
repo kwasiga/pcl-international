@@ -2,7 +2,7 @@
 
 Discord national team draft management for PCL. Python 3.12+, discord.py, asyncpg, PostgreSQL, Docker, and Railway. No tournament, match-statistics, or bracket features are included.
 
-Players opt in using an existing participation role. The bot reserves a balanced random country on a private waitlist. Staff confirm `/draft` to apply national roles and publish bold, plain-text call-ups grouped by country. Respins are unlimited; there are no change counters.
+Players opt in using an existing participation role. The bot reserves a balanced random country on a private waitlist. Staff confirm `/draft run` to apply national roles, then use `/draft country` to reveal one full national squad at a time. Respins are unlimited; there are no change counters.
 
 ## Quick start
 
@@ -74,7 +74,8 @@ Press **Save** to keep any partial configuration and return later. Only fields y
 | `/waitlist view` | Staff | Paginated proposed countries, clubs, statuses, and totals. |
 | `/waitlist add player` | Staff | Adds a member, even without the opt-in role. |
 | `/waitlist remove player` | Staff | Releases a pending reservation without removing an active country. |
-| `/draft` | Staff | Shows counts and asks confirmation; freezes all eligible pending players into a durable batch. |
+| `/draft run` | Staff | Shows counts and asks confirmation; assigns all eligible pending players in a durable batch. Holds public squad announcements. |
+| `/draft country [country]` | Staff | Publishes one country's full current squad. Select a country or omit it for a random unreleased squad. Repeating reveals the next country without changing assignments. |
 | `/respin player` | Staff | Proposes a different country; roles change only after confirmation. |
 | `/assign player country` | Staff | Manual assignment/transfer. Exceeding the club limit requires explicit logged confirmation. |
 | `/clear [country]` | Staff | Confirm removal of everyone from one country; omit country to clear all configured countries. Preserves history and the current cycle. |
@@ -112,7 +113,9 @@ The role-operation journal commits before a Discord role change begins. Transfer
 
 Failed role changes stay retryable. Other players in a draft continue. Recovery runs on startup, every minute, and through `/sync`. Failed operations block conflicting changes for that player. Fix permissions/hierarchy or returning-member issues, then run `/sync`.
 
-Public call-ups use plain text with actual role/user mentions, never embeds or DMs. Batch announcements group players by country, split below Discord's message-length limit, and include only verified successful assignments. Staff audit messages show staff/player mentions and country/club role mentions in readable fields. Audit mentions display without sending notifications. Internal operation numbers are omitted from staff-facing logs. An outbox retains outgoing public announcements and staff audit messages. Successful deliveries store message IDs; normal retries do not resend them. A crash after Discord accepts a message but before its ID is committed can still duplicate a message because Discord and PostgreSQL cannot share a transaction.
+Public call-ups use plain text with actual role/user mentions, never embeds or DMs. `/draft run` and automatic recovery hold public squad announcements. `/draft country country:@Ghana` reveals Ghana's full current squad; omit the country to choose randomly among ready, unreleased countries. Each invocation queues exactly one country, with long rosters split below Discord's message-length limit. The configured player cap controls squad size; there is no fixed 20-player requirement. Countries with unfinished role changes must recover before release. The bot verifies current members' country roles before queuing a reveal. Removed, transferred, absent, and prior-cycle draft players do not trigger a stale reveal. Once queued, the country cannot be released again for the same draft players, even after a restart; a later draft adding players allows an updated full-squad release. Previously published draft call-ups are treated as released. Manual assignments and respins keep their immediate individual call-ups.
+
+Staff audit messages show staff/player mentions and country/club role mentions in readable fields. Audit mentions display without sending notifications. Internal operation numbers are omitted from staff-facing logs. An outbox retains outgoing public announcements and staff audit messages. Successful deliveries store message IDs; normal retries do not resend them. A crash after Discord accepts a message but before its ID is committed can still duplicate a message because Discord and PostgreSQL cannot share a transaction.
 
 Reset removes **all configured bot-managed country roles**, including disabled roles and roles held by members without an active database assignment. Failed removals keep the reset frozen and retryable; the new cycle is created only after all removals complete. Permanent history survives. Manual-only waitlist registrations without the current opt-in role are not restored. Since successful assignments remove opt-in, previously assigned players must opt in again to enter the rebuilt waitlist.
 
@@ -147,8 +150,8 @@ ruff format --check bot tests
 2. Railway uses the included `Dockerfile`. Set `DISCORD_TOKEN`, `DISCORD_APPLICATION_ID`, and direct Neon `DATABASE_URL` as service variables. Set `TEST_GUILD_ID` for the initial test server.
 3. Deploy one replica. No public HTTP domain or web port is required for this Discord gateway worker.
 4. Startup applies migrations, registers slash commands, logs into Discord, and resumes unfinished operations. Inspect Railway logs for **PCL International connected**.
-5. Configure the test server with `/setup`, add a few test players, review `/waitlist view`, and confirm `/draft`.
-6. Check announcements, role assignment, `/roster`, `/history`, `/respin`, and `/sync`. Test reset only in the test server.
+5. Configure the test server with `/setup`, add a few test players, review `/waitlist view`, and confirm `/draft run`.
+6. Use `/draft country` for each squad, then check announcements, role assignment, `/roster`, `/history`, `/respin`, and `/sync`. Test reset only in the test server.
 7. For production, remove `TEST_GUILD_ID` to register globally. Global commands can take time to appear; remove old test-server command copies through Discord's application command management if they shadow global commands.
 
 Docker locally:

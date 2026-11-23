@@ -2,7 +2,7 @@
 
 import json
 import logging
-from collections import defaultdict
+import secrets
 
 import discord
 
@@ -942,46 +942,7 @@ class Engine:
             "SELECT id FROM draft_batches WHERE guild_id=$1 AND status='processing'", guild.id
         )
         for batch in batches:
-            # Announce every newly completed subset; deterministic keys prevent normal duplicates.
-            completed = await con.fetch(
-                "SELECT id,user_id,target_country_id FROM role_operations "
-                "WHERE batch_id=$1 AND status='completed' AND NOT EXISTS("
-                "SELECT 1 FROM announcement_outbox WHERE dedupe_key='batch-player:' || role_operations.id::text)",
-                batch["id"],
-            )
-            if completed:
-                cfg = await self.config(con, guild.id, allow_reset=True)
-                if not cfg["callups_channel_id"]:
-                    continue
-                grouped = defaultdict(list)
-                for row in completed:
-                    grouped[row["target_country_id"]].append(row["user_id"])
-                country_names = {}
-                for country_id in grouped:
-                    role = guild.get_role(country_id)
-                    country_names[country_id] = discord.utils.escape_markdown(
-                        discord.utils.escape_mentions(role.name if role else "Country")
-                    )
-                async with con.transaction():
-                    for i, chunk in enumerate(callup_chunks(grouped, country_names=country_names)):
-                        await self.outbox(
-                            con,
-                            guild.id,
-                            f"batch:{batch['id']}:part:{completed[0]['id']}:{i}",
-                            cfg["callups_channel_id"],
-                            chunk,
-                            batch["id"],
-                        )
-                    # Sentinels are never delivered; they track which players have been queued.
-                    for row in completed:
-                        await con.execute(
-                            "INSERT INTO announcement_outbox(guild_id,batch_id,dedupe_key,channel_id,payload,status) "
-                            "VALUES($1,$2,$3,$4,'','marker') ON CONFLICT DO NOTHING",
-                            guild.id,
-                            batch["id"],
-                            f"batch-player:{row['id']}",
-                            cfg["callups_channel_id"],
-                        )
+            # Assignment recovery never publishes squads. Staff reveal them explicitly.
             if not await con.fetchval(
                 "SELECT 1 FROM role_operations WHERE batch_id=$1 AND status <> 'completed'",
                 batch["id"],
@@ -990,6 +951,95 @@ class Engine:
                     "UPDATE draft_batches SET status='completed',completed_at=now() WHERE id=$1",
                     batch["id"],
                 )
+
+    async def release_country(self, guild, actor, country=None):
+        async with self.db.guild(guild.id) as con:
+            async with con.transaction():
+                cfg = await self.config(con, guild.id, required=("callups_channel_id",))
+                cycle = await self.cycle(con, guild.id)
+                managed = await self.role_ids(con, guild.id, "country")
+                if country is not None and country not in managed:
+                    raise RuleError("Choose a configured national team role.")
+                # Existing batch-player sentinels also prevent replaying pre-upgrade call-ups.
+                rows = await con.fetch(
+                    "SELECT o.id,o.batch_id,o.user_id,o.target_country_id FROM role_operations o "
+                    "JOIN players p ON p.guild_id=o.guild_id AND p.user_id=o.user_id "
+                    "WHERE o.guild_id=$1 AND o.cycle_id=$2 AND o.batch_id IS NOT NULL "
+                    "AND o.status='completed' AND p.present "
+                    "AND p.current_country_role_id=o.target_country_id "
+                    "AND NOT EXISTS (SELECT 1 FROM announcement_outbox a "
+                    "WHERE a.dedupe_key='batch-player:' || o.id::text) "
+                    "AND NOT EXISTS (SELECT 1 FROM role_operations pending "
+                    "WHERE pending.guild_id=o.guild_id AND pending.status <> 'completed' "
+                    "AND (pending.target_country_id=o.target_country_id "
+                    "OR pending.from_country_id=o.target_country_id)) ORDER BY o.id",
+                    guild.id,
+                    cycle,
+                )
+                ready = sorted(
+                    {r["target_country_id"] for r in rows}
+                    & {rid for rid in managed if guild.get_role(rid)}
+                )
+                if country is not None:
+                    if country not in ready:
+                        raise RuleError(
+                            "That country has no unreleased draft squad ready. Run /draft run "
+                            "first, or /sync if role changes are awaiting recovery."
+                        )
+                elif ready:
+                    country = secrets.choice(ready)
+                else:
+                    raise RuleError(
+                        "No unreleased squads are ready. Run /draft run first, or /sync "
+                        "if role changes are awaiting recovery."
+                    )
+                roster = await con.fetch(
+                    "SELECT user_id FROM players WHERE guild_id=$1 AND present "
+                    "AND current_country_role_id=$2 ORDER BY user_id",
+                    guild.id,
+                    country,
+                )
+                # Verify the current squad rather than announcing a stale frozen batch.
+                for player in roster:
+                    member = await guild.fetch_member(player["user_id"])
+                    if country not in {role.id for role in member.roles}:
+                        raise RuleError(
+                            "A squad member's country role differs from the saved assignment. "
+                            "Run /sync and resolve the discrepancy before revealing this squad."
+                        )
+                pending = [r for r in rows if r["target_country_id"] == country]
+                players = [r["user_id"] for r in roster]
+                name = discord.utils.escape_markdown(
+                    discord.utils.escape_mentions(guild.get_role(country).name)
+                )
+                for index, chunk in enumerate(
+                    callup_chunks({country: players}, country_names={country: name})
+                ):
+                    await self.outbox(
+                        con,
+                        guild.id,
+                        f"batch:country:{cycle}:{country}:{pending[0]['id']}:{index}",
+                        cfg["callups_channel_id"],
+                        chunk,
+                    )
+                for row in pending:
+                    await con.execute(
+                        "INSERT INTO announcement_outbox(guild_id,batch_id,dedupe_key,channel_id,payload,status) "
+                        "VALUES($1,$2,$3,$4,'','marker') ON CONFLICT DO NOTHING",
+                        guild.id,
+                        row["batch_id"],
+                        f"batch-player:{row['id']}",
+                        cfg["callups_channel_id"],
+                    )
+                await self.audit(
+                    con,
+                    guild.id,
+                    "country squad released",
+                    actor,
+                    country=country,
+                    players=len(players),
+                )
+                return country, len(players)
 
     async def set_club(self, member, role, actor):
         async with self.db.guild(member.guild.id) as con:

@@ -17,6 +17,9 @@ class StaffCommands(commands.Cog):
     club = app_commands.Group(
         name="club", description="Manage primary league clubs", guild_only=True
     )
+    draft = app_commands.Group(
+        name="draft", description="Assign players and reveal national squads", guild_only=True
+    )
 
     def __init__(self, bot):
         self.bot, self.engine, self.db = bot, bot.engine, bot.db
@@ -107,9 +110,8 @@ class StaffCommands(commands.Cog):
             "Waitlist entry removed." if removed else "No pending entry found.", ephemeral=True
         )
 
-    @app_commands.command(description="Review and execute all eligible pending call-ups")
-    @app_commands.guild_only()
-    async def draft(self, i: discord.Interaction):
+    @draft.command(name="run", description="Assign pending players; hold squad announcements")
+    async def draft_run(self, i: discord.Interaction):
         await self.check(i)
         async with self.db.pool.acquire() as con:
             await self.engine.config(con, i.guild_id)
@@ -121,12 +123,13 @@ class StaffCommands(commands.Cog):
         text = "Confirm the official draft? All eligible pending players will be processed.\n"
         text += "\n".join(f"**{r['status']}:** {r['n']}" for r in counts) or "No pending players."
         text += "\nEligibility and capacity are checked again before freezing the batch."
+        text += "\nSquad announcements are held until you use /draft country."
 
         async def run(click):
             success, failed = await self.engine.draft(i.guild, click.user.id)
             result = f"Draft finished: **{success} successful**, **{failed} awaiting retry**."
             if success:
-                result += " Call-ups for successful assignments are queued for publication."
+                result += " Use /draft country to reveal one country's full squad at a time."
             if failed:
                 result += (
                     " Check the staff logs, resolve the reported issue, then run /sync to retry."
@@ -134,6 +137,22 @@ class StaffCommands(commands.Cog):
             return result
 
         await self.confirm(i, text, run)
+
+    @draft.command(
+        name="country", description="Reveal one full squad; omit country for a random one"
+    )
+    @app_commands.describe(country="Country to reveal; leave empty for a random unreleased squad")
+    async def draft_country(self, i: discord.Interaction, country: discord.Role | None = None):
+        await self.check(i)
+        selected, count = await self.engine.release_country(
+            i.guild, i.user.id, country.id if country else None
+        )
+        await self.engine.flush_outbox(i.guild)
+        await i.followup.send(
+            f"<@&{selected}>: **{count} players** queued for the call-ups channel. "
+            "Run /draft country again for the next squad.",
+            ephemeral=True,
+        )
 
     @app_commands.command(description="Manually assign or transfer a player to a country")
     @app_commands.guild_only()
