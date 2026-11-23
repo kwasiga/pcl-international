@@ -3,12 +3,17 @@ import discord
 from bot.services.rules import RuleError
 
 
-async def require_staff(db, member, *, admin=False):
+async def require_staff(db, member, *, admin=False, connection=None):
     """Configured role hierarchy gates staff commands and their components."""
     if not isinstance(member, discord.Member):
         raise RuleError("Use this command inside your Discord server.")
-    async with db.pool.acquire() as con:
-        config = await con.fetchrow(
+    if connection is None:
+        async with db.pool.acquire() as con:
+            config = await con.fetchrow(
+                "SELECT staff_role_id FROM guild_config WHERE guild_id=$1", member.guild.id
+            )
+    else:
+        config = await connection.fetchrow(
             "SELECT staff_role_id FROM guild_config WHERE guild_id=$1", member.guild.id
         )
     if config is None or config["staff_role_id"] is None:

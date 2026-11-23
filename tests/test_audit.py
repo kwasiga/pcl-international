@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock
 
-from bot.services.audit import audit_messages
+from bot.services.audit import audit_messages, override_name
 from bot.services.engine import Engine
 
 
@@ -51,6 +51,13 @@ class AuditFormattingTests(unittest.TestCase):
             self.assertLessEqual(len(chunk), 1900)
         for rid in roles:
             self.assertEqual("\n".join(chunks).count(f"<@&{rid}>"), 1)
+
+    def test_reroll_override_is_labelled_correctly(self):
+        text = audit_messages("respin", 100, 200, {"override": "respin_limit"})[0]
+        self.assertIn("**Override:** reroll limit", text)
+        self.assertEqual(
+            override_name("club_capacity,respin_limit"), "club capacity + reroll limit"
+        )
 
 
 class AuditStorageTests(unittest.IsolatedAsyncioTestCase):

@@ -174,5 +174,9 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                 elif command.name == "roster":
                     self.assertEqual(data["options"][0]["type"], 3)
                     self.assertTrue(data["options"][0]["autocomplete"])
+                elif command.name == "respin":
+                    override = next(o for o in data["options"] if o["name"] == "override_limit")
+                    self.assertEqual(override["type"], 5)
+                    self.assertFalse(override["required"])
         finally:
             await bot.close()

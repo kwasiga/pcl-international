@@ -4,8 +4,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from bot.services.audit import override_name
 from bot.services.permissions import require_staff
-from bot.services.rules import POSITION_GROUPS, RuleError
+from bot.services.rules import POSITION_GROUPS, RESPIN_LIMIT, RuleError, respin_notice
 from bot.views.common import Confirmation, Pages, StaffView
 from bot.views.setup import SetupPanel
 
@@ -188,13 +189,17 @@ class StaffCommands(commands.Cog):
         else:
             await i.followup.send(await execute(i), ephemeral=True)
 
-    @app_commands.command(description="Propose an unlimited respin; apply only after confirmation")
+    @app_commands.command(description="Propose a reroll; three per player per draft cycle")
     @app_commands.guild_only()
-    async def respin(self, i: discord.Interaction, player: discord.Member):
+    @app_commands.describe(override_limit="Admin approval to exceed the three-reroll limit")
+    async def respin(
+        self, i: discord.Interaction, player: discord.Member, override_limit: bool = False
+    ):
         await self.check(i)
-        current, target, exceptions = await self.engine.propose_respin(player)
-        async with self.db.pool.acquire() as con:
-            cycle = await self.engine.cycle(con, i.guild_id)
+        current, target, exceptions, cycle, used = await self.engine.propose_respin(
+            player, override_limit=override_limit
+        )
+        notice = respin_notice(used, override=override_limit)
 
         async def apply(click, country, action="respin"):
             ok = await self.engine.assign(
@@ -204,11 +209,14 @@ class StaffCommands(commands.Cog):
                 expected=current,
                 expected_cycle=cycle,
                 action=action,
+                respin_override=override_limit,
+                expected_respins=used,
             )
             return (
-                "Respin completed. Call-up queued."
+                f"Respin completed. **{max(0, RESPIN_LIMIT - used - 1)} rerolls remaining**. Call-up queued."
                 if ok
-                else "Respin recorded for recovery. Use /sync after resolving the role error."
+                else "Respin recorded for recovery. It counts once recovery succeeds. "
+                "Use /sync after resolving the role error."
             )
 
         if target:
@@ -218,14 +226,14 @@ class StaffCommands(commands.Cog):
 
             await self.confirm(
                 i,
-                f"**Respin {player.mention}**\nCurrent: <@&{current}>\nProposed: <@&{target}>\nNo roles change until confirmed.",
+                f"**Respin {player.mention}**\n{notice}\nCurrent: <@&{current}>\nProposed: <@&{target}>\nNo roles change until confirmed.",
                 run,
             )
         elif exceptions:
             # Paginated role selection avoids Discord's 25-option limit.
-            view = ExceptionPicker(self.db, i.user.id, i.guild, exceptions, apply)
+            view = ExceptionPicker(self.db, i.user.id, i.guild, exceptions, apply, notice=notice)
             await i.followup.send(
-                "No unused eligible country remains. Staff may explicitly select a previously represented country below. Club limits still apply.",
+                f"{notice}\nNo unused eligible country remains. Staff may explicitly select a previously represented country below. Club limits still apply.",
                 view=view,
                 ephemeral=True,
             )
@@ -340,7 +348,7 @@ class StaffCommands(commands.Cog):
             actor = f"<@{r['actor_id']}>" if r["actor_id"] else "System"
             lines.append(
                 f"<t:{int(r['created_at'].timestamp())}:f> • Cycle {r['cycle_id']} • **{r['action']}**\n{old} → {new} • {actor}"
-                + (" • capacity override" if r["override_type"] else "")
+                + (f" • {override_name(r['override_type'])} override" if r["override_type"] else "")
             )
         await self.pages(i, f"{player.display_name} — History", lines)
 
@@ -456,9 +464,10 @@ class StaffCommands(commands.Cog):
 
 
 class ExceptionPicker(StaffView):
-    def __init__(self, db, owner, guild, countries, apply):
+    def __init__(self, db, owner, guild, countries, apply, *, notice=""):
         super().__init__(db, owner)
         self.guild, self.countries, self.apply = guild, countries, apply
+        self.notice = notice
         self.page = 0
         self.build()
 
@@ -484,7 +493,7 @@ class ExceptionPicker(StaffView):
 
             confirm = Confirmation(self.db, self.owner, run)
             await i.response.edit_message(
-                content=f"Confirm previous-country exception: <@&{target}>? Club capacity will be checked again.",
+                content=f"{self.notice}\nConfirm previous-country exception: <@&{target}>? Club capacity will be checked again.",
                 view=confirm,
             )
             confirm.message = await i.original_response()

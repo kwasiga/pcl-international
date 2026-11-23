@@ -34,7 +34,7 @@ class DraftRulesTests(unittest.TestCase):
     def test_respin_excludes_current_and_previous(self):
         self.assertEqual(choose_country([1, 2, 3], {}, {}, None, 5, excluded=[1, 2]), 3)
 
-    def test_unlimited_respins_have_no_counter(self):
+    def test_country_selector_does_not_track_reroll_usage(self):
         # Repeated proposal requests do not consume an assignment allowance.
         for _ in range(500):
             self.assertEqual(choose_country([1, 2], {}, {}, None, 5, excluded=[1]), 2)

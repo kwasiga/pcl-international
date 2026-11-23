@@ -7,6 +7,7 @@ import secrets
 import discord
 
 from bot.services.audit import audit_messages
+from bot.services.permissions import require_staff
 from bot.services.roles import apply_roles, validate_role
 from bot.services.rules import (
     RuleError,
@@ -18,6 +19,8 @@ from bot.services.rules import (
     player_positions,
     position_occupancy,
     SETUP_LABELS,
+    RESPIN_LIMIT,
+    respin_notice,
 )
 
 log = logging.getLogger(__name__)
@@ -481,7 +484,17 @@ class Engine:
                 )
 
     async def prepare_operation(
-        self, con, guild, uid, target, action, actor, *, override=False, batch=None
+        self,
+        con,
+        guild,
+        uid,
+        target,
+        action,
+        actor,
+        *,
+        override=False,
+        batch=None,
+        respin_override=False,
     ):
         gid = guild.id
         cfg = await self.config(
@@ -547,7 +560,15 @@ class Engine:
             target,
             action,
             actor,
-            "club_capacity" if override else None,
+            ",".join(
+                kind
+                for kind, enabled in (
+                    ("club_capacity", override),
+                    ("respin_limit", respin_override),
+                )
+                if enabled
+            )
+            or None,
             batch,
         )
         # A manual assignment replaces any existing pending reservation atomically.
@@ -779,6 +800,8 @@ class Engine:
         expected=None,
         expected_cycle=None,
         action="manual",
+        respin_override=False,
+        expected_respins=None,
     ):
         async with self.db.guild(member.guild.id) as con:
             async with con.transaction():
@@ -796,16 +819,28 @@ class Engine:
                 )
                 if expected is not None and current != expected:
                     raise RuleError("The player’s country changed. Request a new proposal.")
+                limit_overridden = False
                 if action.startswith("respin"):
                     if not current or current == country:
                         raise RuleError(
                             "The player must have a different active country to respin."
                         )
+                    cycle = await self.cycle(con, member.guild.id)
+                    count = await self.respins_used(con, member.guild.id, member.id, cycle)
+                    if expected_respins is not None and count != expected_respins:
+                        raise RuleError("The reroll count changed. Run /respin again to review it.")
+                    respin_notice(count, override=respin_override)
+                    if respin_override:
+                        admin = member.guild.get_member(actor) or await member.guild.fetch_member(
+                            actor
+                        )
+                        await require_staff(self.db, admin, admin=True, connection=con)
+                    limit_overridden = respin_override and count >= RESPIN_LIMIT
                     used = await con.fetchval(
                         "SELECT 1 FROM cycle_exclusions WHERE guild_id=$1 AND cycle_id=$2 "
                         "AND user_id=$3 AND country_role_id=$4",
                         member.guild.id,
-                        await self.cycle(con, member.guild.id),
+                        cycle,
                         member.id,
                         country,
                     )
@@ -820,9 +855,25 @@ class Engine:
                                 "An unused country is now available. Request a new random respin."
                             )
                 opid = await self.prepare_operation(
-                    con, member.guild, member.id, country, action, actor, override=override
+                    con,
+                    member.guild,
+                    member.id,
+                    country,
+                    action,
+                    actor,
+                    override=override,
+                    respin_override=limit_overridden,
                 )
             return await self.execute_operation(con, member.guild, opid)
+
+    async def respins_used(self, con, gid, uid, cycle):
+        return await con.fetchval(
+            "SELECT count(*) FROM assignment_history WHERE guild_id=$1 AND user_id=$2 "
+            "AND cycle_id=$3 AND action IN ('respin','respin_exception')",
+            gid,
+            uid,
+            cycle,
+        )
 
     async def respin_target(self, con, member):
         gid, uid = member.guild.id, member.id
@@ -845,11 +896,14 @@ class Engine:
             balance=False,
         )
 
-    async def propose_respin(self, member):
+    async def propose_respin(self, member, *, override_limit=False):
         async with self.db.guild(member.guild.id) as con:
             await self.config(con, member.guild.id)
             await self.idle_player(con, member.guild.id, member.id)
             await self.refresh_player(con, member)
+            cycle = await self.cycle(con, member.guild.id)
+            used = await self.respins_used(con, member.guild.id, member.id, cycle)
+            respin_notice(used, override=override_limit)
             current = await con.fetchval(
                 "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
                 member.guild.id,
@@ -872,7 +926,7 @@ class Engine:
                         == cid
                     ):
                         exceptions.append(cid)
-            return current, target, exceptions
+            return current, target, exceptions, cycle, used
 
     async def needs_override(self, member, target):
         async with self.db.guild(member.guild.id) as con:

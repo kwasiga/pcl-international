@@ -81,6 +81,15 @@ class PermissionsTests(unittest.IsolatedAsyncioTestCase):
         await require_staff(self.db, Member(5))
         self.assertEqual(self.con.fetchrow.call_args.args[-1], 123)
 
+    async def test_override_can_check_permissions_on_existing_locked_connection(self):
+        def unexpected_acquire():
+            raise AssertionError("Must not acquire another connection while holding the guild lock")
+
+        self.db.pool.acquire = unexpected_acquire
+        await require_staff(self.db, Member(5), admin=True, connection=self.con)
+        with self.assertRaises(RuleError):
+            await require_staff(self.db, Member(1), admin=True, connection=self.con)
+
     async def test_dms_denied(self):
         with self.assertRaises(RuleError):
             await require_staff(self.db, SimpleNamespace(id=10))

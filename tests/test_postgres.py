@@ -5,7 +5,7 @@ import os
 import unittest
 import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from bot.database.connection import Database
 from bot.services.engine import Engine
@@ -281,10 +281,10 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
     async def test_respin_history_exception_and_remove_clear_exclusions(self):
         member = self.guild.player(100)
         await self.engine.assign(member, 1, 77)
-        current, target, exceptions = await self.engine.propose_respin(member)
+        current, target, exceptions, _, _ = await self.engine.propose_respin(member)
         self.assertEqual((current, target), (1, 2))
         await self.engine.assign(member, 2, 77, expected=1, action="respin")
-        current, target, exceptions = await self.engine.propose_respin(member)
+        current, target, exceptions, _, _ = await self.engine.propose_respin(member)
         self.assertIsNone(target)
         self.assertEqual(exceptions, [1])
         await self.engine.assign(member, 1, 77, expected=2, action="respin_exception")
@@ -307,6 +307,68 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             await self.fetchval("SELECT override_type FROM assignment_history WHERE user_id=102"),
             "club_capacity",
         )
+
+    async def test_reroll_limit_counts_recovery_once_and_blocks_a_fourth(self):
+        member = self.guild.player(100)
+        await self.engine.assign(member, 1, 77)
+        await self.engine.assign(member, 2, 77, action="respin")
+        await self.engine.assign(member, 1, 77, action="respin_exception")
+        current, target, exceptions, cycle, used = await self.engine.propose_respin(member)
+        self.assertEqual((current, target, exceptions, used), (1, None, [2], 2))
+        member.fail = True
+        self.assertFalse(
+            await self.engine.assign(
+                member, 2, 77, action="respin_exception", expected_respins=2, expected_cycle=cycle
+            )
+        )
+        async with self.db.pool.acquire() as con:
+            self.assertEqual(await self.engine.respins_used(con, self.guild.id, 100, cycle), 2)
+        member.fail = False
+        await self.engine.recover(self.guild)
+        await self.engine.recover(self.guild)
+        async with self.db.pool.acquire() as con:
+            self.assertEqual(await self.engine.respins_used(con, self.guild.id, 100, cycle), 3)
+        with self.assertRaisesRegex(RuleError, "no rerolls left"):
+            await self.engine.propose_respin(member)
+        with self.assertRaisesRegex(RuleError, "no rerolls left"):
+            await self.engine.assign(member, 1, 77, action="respin_exception")
+
+    async def test_reroll_override_is_logged_remove_preserves_usage_and_reset_replenishes(self):
+        member = self.guild.player(100)
+        self.guild.player(77, (20,))
+        await self.engine.assign(member, 1, 77)
+        await self.engine.assign(member, 2, 77, action="respin")
+        await self.engine.assign(member, 1, 77, action="respin_exception")
+        await self.engine.assign(member, 2, 77, action="respin_exception")
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock) as admin:
+            await self.engine.assign(
+                member,
+                1,
+                77,
+                action="respin_exception",
+                respin_override=True,
+                expected_respins=3,
+            )
+        admin.assert_awaited_once()
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT override_type FROM assignment_history ORDER BY id DESC LIMIT 1"
+            ),
+            "respin_limit",
+        )
+        async with self.db.pool.acquire() as con:
+            old_cycle = await self.engine.cycle(con, self.guild.id)
+            self.assertEqual(await self.engine.respins_used(con, self.guild.id, 100, old_cycle), 4)
+        await self.engine.assign(member, None, 77, action="remove")
+        await self.engine.assign(member, 1, 77)
+        with self.assertRaisesRegex(RuleError, "no rerolls left"):
+            await self.engine.propose_respin(member)
+        self.assertTrue(await self.engine.start_reset(self.guild, 77))
+        async with self.db.pool.acquire() as con:
+            new_cycle = await self.engine.cycle(con, self.guild.id)
+            self.assertNotEqual(new_cycle, old_cycle)
+            self.assertEqual(await self.engine.respins_used(con, self.guild.id, 100, new_cycle), 0)
+            self.assertEqual(await self.engine.respins_used(con, self.guild.id, 100, old_cycle), 4)
 
     async def test_disabled_country_never_selected_and_disabled_club_unaffiliated(self):
         async with self.db.guild(self.guild.id) as con:

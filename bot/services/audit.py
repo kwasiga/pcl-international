@@ -30,9 +30,16 @@ LABELS = {
 }
 
 
+def override_name(value):
+    names = {"club_capacity": "club capacity", "respin_limit": "reroll limit"}
+    return " + ".join(names.get(kind, kind) for kind in value.split(","))
+
+
 def display_value(key, value):
     if value is None:
         return "Unaffiliated" if key == "club" else "None"
+    if key == "override" and isinstance(value, str):
+        return override_name(value)
     if isinstance(value, dict):
         return " • ".join(f"{label(k)}: {display_value(k, v)}" for k, v in value.items())
     if isinstance(value, (list, tuple, set)):

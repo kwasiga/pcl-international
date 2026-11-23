@@ -2,7 +2,7 @@
 
 Discord national team draft management for PCL. Python 3.12+, discord.py, asyncpg, PostgreSQL, Docker, and Railway. No tournament, match-statistics, or bracket features are included.
 
-Players opt in using an existing participation role. The bot reserves a balanced random country on a private waitlist. Staff confirm `/draft run` to apply national roles and announce each successful assignment in the call-ups channel. `/draft country` provides a separate full-squad announcement for one country at a time. Respins are unlimited; there are no change counters.
+Players opt in using an existing participation role. The bot reserves a balanced random country on a private waitlist. Staff confirm `/draft run` to apply national roles and announce each successful assignment in the call-ups channel. `/draft country` provides a separate full-squad announcement for one country at a time. Each player gets three successful respins per draft cycle, with explicit admin overrides available.
 
 ## Quick start
 
@@ -76,7 +76,7 @@ Press **Save** to keep any partial configuration and return later. Only fields y
 | `/waitlist remove player` | Staff | Releases a pending reservation without removing an active country. |
 | `/draft run` | Staff | Shows counts and asks confirmation; assigns all eligible pending players in a durable batch and announces each successful assignment in the call-ups channel. |
 | `/draft country [country]` | Staff | Publishes one country's full current squad. Select a country or omit it for a random unreleased squad. Repeating reveals the next country without changing assignments. |
-| `/respin player` | Staff | Randomly proposes any eligible unused country with equal odds; roles change only after confirmation. |
+| `/respin player [override_limit]` | Staff | Randomly proposes an eligible country, with three rerolls per player per cycle. Warns before the third; `override_limit:True` explicitly approves an extra reroll with a logged admin confirmation. |
 | `/assign player country` | Staff | Manual assignment/transfer. Exceeding the club limit requires explicit logged confirmation. |
 | `/clear [country]` | Staff | Confirm removal of everyone from one country; omit country to clear all configured countries. Preserves history and the current cycle. |
 | `/remove player` | Staff | Clears country and current-cycle exclusions, preserves history, and does not requeue. |
@@ -98,6 +98,8 @@ An authorized staff member has the designated admin role or a higher role in the
 - A member with one configured club uses it. A saved primary club remains valid while held and enabled. Multiple club roles without a valid primary block assignment until `/club set`; no club means unaffiliated and no club-specific cap.
 - Respins exclude the current country and every country represented since the last removal in the current cycle. If no unused eligible country remains, staff may explicitly select a previously represented country; club limits still apply.
 - Proposals and canceled confirmations never change roles or history. Capacity and current assignment are checked again on confirmation. Old-cycle respin/reset confirmations are rejected.
+- Reroll usage counts successful `respin` and previous-country exception actions from permanent history in the current draft cycle, including actions completed before this limit was introduced. Initial drafts and manual assignments do not consume a reroll. Cancellations and failed operations do not count until recovery succeeds. Usage is checked again under the server lock before recording an operation; stale confirmations are rejected if the count changed. Removing, clearing, or re-registering a player does not replenish rerolls in the same cycle. A full reset starts a new cycle with three rerolls again.
+- Every reroll confirmation shows the number used and remaining. At two used, it warns **THIRD AND FINAL reroll** before confirmation. At three or more used, normal rerolls are blocked with a **no rerolls left** explanation. Use `/respin player:@Player override_limit:True` for an explicitly confirmed extra reroll. The configured admin role or higher is required and rechecked at confirmation. Successful overrides are recorded as `respin_limit` in the operation, permanent history, and staff audit. Overrides do not relax country caps, club limits, or previous-country exception rules.
 - Only `/assign` with explicit override confirmation may exceed the club limit.
 - After a country assignment succeeds, the bot removes the opt-in role. Removing opt-in does not clear a waitlist entry or active country.
 - A confirmed respin adds a purple **Respun** role. The bot creates this role automatically on the first confirmed respin and reuses it. It carries no permissions. Manual transfers retain the marker; `/remove` and `/reset` clear it. Returning respun players have the marker restored.

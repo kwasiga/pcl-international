@@ -6,6 +6,32 @@ class RuleError(Exception):
     """A safe, user-facing explanation of an invalid operation."""
 
 
+RESPIN_LIMIT = 3
+
+
+def respin_notice(used, *, override=False):
+    remaining = max(0, RESPIN_LIMIT - used)
+    if not remaining:
+        if not override:
+            raise RuleError(
+                f"This player has no rerolls left ({used}/{RESPIN_LIMIT} used this draft cycle). "
+                "An admin can use /respin with override_limit:True to explicitly approve an extra reroll."
+            )
+        return (
+            f"**ADMIN OVERRIDE — no rerolls remaining ({used}/{RESPIN_LIMIT} used).**\n"
+            "Confirming approves an extra reroll beyond the limit. This override will be logged."
+        )
+    notice = f"Rerolls used: **{used}/{RESPIN_LIMIT}** — **{remaining} remaining**."
+    if remaining == 1:
+        notice += (
+            "\n**Warning: this is their THIRD AND FINAL reroll. "
+            "After it succeeds, they will have 0 rerolls left.**"
+        )
+    else:
+        notice += f" After this reroll succeeds: **{remaining - 1} remaining**."
+    return notice
+
+
 def primary_club(held, configured, saved=None):
     matches = set(held) & set(configured)
     if saved in matches:
