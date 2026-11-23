@@ -528,7 +528,7 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.fetchval("SELECT count(*) FROM cycle_exclusions"), 0)
         self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 3)
 
-    async def test_position_balance_counts_active_and_pending_players(self):
+    async def test_legacy_positions_no_longer_affect_draft_choices(self):
         self.guild.role_map[4] = Role(4)
         async with self.db.guild(self.guild.id) as con:
             await con.execute(
@@ -539,18 +539,44 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.assign(attacker, 1, 77)
         await self.engine.assign(goalkeeper, 2, 77)
         incoming = self.guild.player(102, (4,))
-        await self.engine.register(incoming)
+        with patch("bot.services.rules.secrets.choice", side_effect=min):
+            await self.engine.register(incoming)
         self.assertEqual(
             await self.fetchval(
                 "SELECT proposed_country_role_id FROM waitlist_entries WHERE user_id=102"
             ),
-            2,
+            1,
         )
         self.assertEqual(
-            await self.fetchval("SELECT position_groups FROM players WHERE user_id=102"), ["ATT"]
+            await self.fetchval("SELECT position_groups FROM players WHERE user_id=102"), []
         )
 
-    async def test_position_update_rebalances_waitlist_without_transferring_active_player(self):
+    async def test_international_gk_role_can_be_saved_and_cleared_without_changing_legacy_mappings(
+        self,
+    ):
+        async with self.db.pool.acquire() as con:
+            await con.execute("INSERT INTO position_roles VALUES($1,3,'GK')", self.guild.id)
+        values = dict(
+            countries={1, 2},
+            clubs={8, 9},
+            staff_role_id=20,
+            opt_in_role_id=21,
+            callups_channel_id=None,
+            logs_channel_id=None,
+            club_limit=2,
+            international_gk_role_id=3,
+        )
+        self.guild.get_role(3).managed = True
+        await self.engine.save_config(self.guild, values, 77, expected_revision=1)
+        self.assertEqual(
+            await self.fetchval("SELECT international_gk_role_id FROM guild_config"), 3
+        )
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM position_roles"), 1)
+        values["international_gk_role_id"] = None
+        await self.engine.save_config(self.guild, values, 77, expected_revision=2)
+        self.assertIsNone(await self.fetchval("SELECT international_gk_role_id FROM guild_config"))
+
+    async def test_legacy_position_data_is_preserved_but_no_longer_updated(self):
         self.guild.role_map[4] = Role(4)
         async with self.db.guild(self.guild.id) as con:
             await con.execute(
@@ -558,10 +584,10 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             )
         member = self.guild.player(100, (3, 4))
         await self.engine.assign(member, 1, 77)
-        self.assertEqual(
-            await self.fetchval("SELECT position_groups FROM players WHERE user_id=100"),
-            ["ATT", "GK"],
-        )
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE players SET position_groups=ARRAY['ATT','GK'] WHERE user_id=100"
+            )
         member.roles = [r for r in member.roles if r.id != 3]
         async with self.db.guild(self.guild.id) as con:
             await self.engine.refresh_player(con, member)
@@ -569,7 +595,8 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=100"), 1
         )
         self.assertEqual(
-            await self.fetchval("SELECT position_groups FROM players WHERE user_id=100"), ["ATT"]
+            await self.fetchval("SELECT position_groups FROM players WHERE user_id=100"),
+            ["ATT", "GK"],
         )
 
     async def test_country_cap_counts_pending_and_cannot_be_manually_overridden(self):

@@ -19,7 +19,7 @@ class CountryCapTests(unittest.TestCase):
     def test_over_cap_country_never_receives_new_player(self):
         self.assertIsNone(choose_country([1], {1: 12}, {}, None, 5, country_cap=10))
 
-    def test_cap_is_not_overridden_by_position_preferences(self):
+    def test_cap_still_applies_to_random_respins(self):
         self.assertEqual(
             choose_country(
                 [1, 2],
@@ -27,8 +27,7 @@ class CountryCapTests(unittest.TestCase):
                 {},
                 None,
                 5,
-                player_positions=["GK"],
-                position_counts={(2, "GK"): 1},
+                balance=False,
                 country_cap=2,
             ),
             2,

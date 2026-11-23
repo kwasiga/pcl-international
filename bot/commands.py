@@ -6,7 +6,7 @@ from discord.ext import commands
 
 from bot.services.audit import override_name
 from bot.services.permissions import require_staff
-from bot.services.rules import POSITION_GROUPS, RESPIN_LIMIT, RuleError, respin_notice
+from bot.services.rules import RESPIN_LIMIT, RuleError, goalkeeper_groups, respin_notice
 from bot.views.common import Confirmation, Pages, StaffView
 from bot.views.setup import SetupPanel
 
@@ -53,12 +53,7 @@ class StaffCommands(commands.Cog):
             cfg = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", i.guild_id)
             countries = await self.engine.role_ids(con, i.guild_id, "country", True)
             clubs = await self.engine.role_ids(con, i.guild_id, "club", True)
-            mapping = await self.engine.position_mapping(con, i.guild_id)
-            positions = {
-                group: {rid for rid, pos in mapping.items() if pos == group}
-                for group in POSITION_GROUPS
-            }
-        panel = SetupPanel(self.engine, i.user.id, i.guild, cfg, countries, clubs, positions)
+        panel = SetupPanel(self.engine, i.user.id, i.guild, cfg, countries, clubs)
         await i.followup.send(embed=panel.embed(), view=panel, ephemeral=True)
         panel.message = await i.original_response()
 
@@ -67,7 +62,7 @@ class StaffCommands(commands.Cog):
         await self.check(i)
         async with self.db.pool.acquire() as con:
             rows = await con.fetch(
-                "SELECT w.*,p.primary_club_role_id,p.position_groups FROM waitlist_entries w JOIN players p "
+                "SELECT w.*,p.primary_club_role_id FROM waitlist_entries w JOIN players p "
                 "USING(guild_id,user_id) WHERE w.guild_id=$1 AND w.status NOT IN ('removed','completed') ORDER BY w.id",
                 i.guild_id,
             )
@@ -86,10 +81,7 @@ class StaffCommands(commands.Cog):
                 if r["proposed_country_role_id"]
                 else "No country"
             )
-            lines.append(
-                f"<@{r['user_id']}> — {club} → {country} — **{r['status']}**"
-                + (f" — {'/'.join(r['position_groups'])}" if r["position_groups"] else "")
-            )
+            lines.append(f"<@{r['user_id']}> — {club} → {country} — **{r['status']}**")
         await self.pages(i, "PCL International — Waitlist", lines)
 
     @waitlist.command(
@@ -287,7 +279,7 @@ class StaffCommands(commands.Cog):
                 raise RuleError("Choose a country from the configured national team list.")
             cfg = await self.engine.config(con, i.guild_id, allow_reset=True)
             rows = await con.fetch(
-                "SELECT user_id,primary_club_role_id,club_conflict,present,position_groups FROM players "
+                "SELECT user_id,primary_club_role_id,club_conflict,present FROM players "
                 "WHERE guild_id=$1 AND current_country_role_id=$2 ORDER BY primary_club_role_id NULLS LAST,user_id",
                 i.guild_id,
                 country_id,
@@ -307,7 +299,6 @@ class StaffCommands(commands.Cog):
             lines.append(f"\n**{label} ({len(players)})**{warning}")
             lines.extend(
                 f"<@{p['user_id']}>"
-                + (f" — {'/'.join(p['position_groups'])}" if p["position_groups"] else "")
                 + (" — absent" if not p["present"] else "")
                 + (" — club conflict" if p["club_conflict"] else "")
                 for p in players
@@ -330,6 +321,52 @@ class StaffCommands(commands.Cog):
             app_commands.Choice(name=role.name[:100], value=str(role.id))
             for role in sorted(roles, key=lambda r: (r.name.casefold(), r.id))[:25]
         ]
+
+    @app_commands.command(
+        description="List international goalkeepers by country, plus unassigned GKs"
+    )
+    @app_commands.guild_only()
+    async def goalkeepers(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        if i.guild is None:
+            raise RuleError("Use this command inside your Discord server.")
+        async with self.db.pool.acquire() as con:
+            cfg = await self.engine.config(con, i.guild_id, allow_reset=True)
+            goalkeeper = cfg.get("international_gk_role_id")
+            if not goalkeeper or i.guild.get_role(goalkeeper) is None:
+                raise RuleError("Select the International GK role in /setup first.")
+            enabled = await self.engine.role_ids(con, i.guild_id, "country", True)
+            managed = await self.engine.role_ids(con, i.guild_id, "country")
+        members = i.guild.members if i.guild.chunked else await i.guild.chunk()
+        grouped, unassigned = goalkeeper_groups(members, goalkeeper, managed | enabled)
+        lines = [f"**International GK role:** <@&{goalkeeper}>"]
+        countries = [role for rid in enabled if (role := i.guild.get_role(rid)) is not None]
+        for role in sorted(countries, key=lambda r: (r.name.casefold(), r.id)):
+            lines.append(f"\n**<@&{role.id}>**")
+            lines.extend(f"<@{uid}>" for uid in grouped[role.id])
+            if not grouped[role.id]:
+                lines.append("No GK")
+        # A disabled country is still a team, so its GKs must not look unassigned.
+        inactive = [
+            role
+            for rid in managed - enabled
+            if grouped[rid] and (role := i.guild.get_role(rid)) is not None
+        ]
+        for role in sorted(inactive, key=lambda r: (r.name.casefold(), r.id)):
+            lines.append(f"\n**<@&{role.id}> — disabled country**")
+            lines.extend(f"<@{uid}>" for uid in grouped[role.id])
+        lines.append("\n**Unassigned goalkeepers**")
+        lines.extend(f"<@{uid}>" for uid in unassigned)
+        if not unassigned:
+            lines.append("None")
+        total = len(set(unassigned).union(*(set(players) for players in grouped.values())))
+        await self.pages(
+            i,
+            "PCL International — Goalkeepers",
+            lines,
+            staff_only=False,
+            footer=f"International GKs: {total} • Unassigned: {len(unassigned)}",
+        )
 
     @app_commands.command(description="View your transfer history; staff may look up other players")
     @app_commands.guild_only()

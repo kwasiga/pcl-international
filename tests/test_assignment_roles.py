@@ -14,7 +14,6 @@ class AssignmentRoleTests(unittest.IsolatedAsyncioTestCase):
         cfg = {"respin_role_id": None, "opt_in_role_id": 21, "staff_role_id": 20}
         engine.config = AsyncMock(return_value=cfg)
         engine.role_ids = AsyncMock(return_value={1, 2, 8, 9})
-        engine.position_mapping = AsyncMock(return_value={})
         original = guild.create_role
         guild.create_role = AsyncMock(side_effect=original)
         self.assertEqual(await engine.ensure_respin_role(con, guild), 30)

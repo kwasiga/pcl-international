@@ -15,9 +15,6 @@ from bot.services.rules import (
     choose_country,
     occupancy,
     primary_club,
-    POSITION_GROUPS,
-    player_positions,
-    position_occupancy,
     SETUP_LABELS,
     RESPIN_LIMIT,
     respin_notice,
@@ -84,35 +81,6 @@ class Engine:
             batch,
         )
 
-    async def position_mapping(self, con, gid):
-        return {
-            r["role_id"]: r["position_group"]
-            for r in await con.fetch(
-                "SELECT role_id,position_group FROM position_roles WHERE guild_id=$1", gid
-            )
-        }
-
-    async def position_counts(self, con, gid, exclude_user=None):
-        rows = await con.fetch(
-            """
-          WITH seats AS (
-            SELECT user_id,current_country_role_id AS country FROM players
-              WHERE guild_id=$1 AND current_country_role_id IS NOT NULL
-            UNION
-            SELECT user_id,proposed_country_role_id FROM waitlist_entries
-              WHERE guild_id=$1 AND reservation_active
-            UNION
-            SELECT user_id,target_country_id FROM role_operations
-              WHERE guild_id=$1 AND status IN ('pending','failed') AND target_country_id IS NOT NULL
-          ) SELECT s.country,p.position_groups AS positions FROM seats s
-          JOIN players p ON p.guild_id=$1 AND p.user_id=s.user_id
-          WHERE ($2::bigint IS NULL OR s.user_id <> $2)
-        """,
-            gid,
-            exclude_user,
-        )
-        return position_occupancy(rows)
-
     async def refresh_player(self, con, member):
         gid, uid = member.guild.id, member.id
         await con.execute(
@@ -130,15 +98,6 @@ class Engine:
             uid,
             club,
             conflict,
-        )
-        positions = player_positions(
-            [r.id for r in member.roles], await self.position_mapping(con, gid)
-        )
-        await con.execute(
-            "UPDATE players SET position_groups=$3 WHERE guild_id=$1 AND user_id=$2",
-            gid,
-            uid,
-            positions,
         )
         return club, conflict
 
@@ -206,12 +165,8 @@ class Engine:
             player["primary_club_role_id"],
             cfg["club_limit"],
             excluded,
-            player_positions=player["position_groups"],
             country_cap=cfg.get("country_cap"),
             balance=balance,
-            position_counts=(await self.position_counts(con, guild.id, uid))
-            if balance and player["position_groups"]
-            else None,
         )
 
     async def idle_player(self, con, gid, uid):
@@ -324,23 +279,18 @@ class Engine:
 
     async def save_config(self, guild, values, actor, expected_revision=None):
         countries, clubs = set(values["countries"]), set(values["clubs"])
-        position_roles = {}
-        for group in POSITION_GROUPS:
-            for rid in values.get(f"pos_{group}", set()):
-                if rid in position_roles:
-                    raise RuleError(
-                        "Each position role must belong to one position group. Players can hold roles from multiple groups."
-                    )
-                role = guild.get_role(rid)
-                if not role or role.is_default():
-                    raise RuleError("Select existing position roles other than @everyone.")
-                position_roles[rid] = group
-        if set(position_roles) & (
-            countries | clubs | {values.get("staff_role_id"), values.get("opt_in_role_id")}
-        ):
-            raise RuleError(
-                "Position roles must be separate from country, club, staff and opt-in roles."
-            )
+        goalkeeper = values.get("international_gk_role_id")
+        if goalkeeper:
+            role = guild.get_role(goalkeeper)
+            if not role or role.is_default():
+                raise RuleError("Select an existing International GK role other than @everyone.")
+            if goalkeeper in countries | clubs | {
+                values.get("staff_role_id"),
+                values.get("opt_in_role_id"),
+            }:
+                raise RuleError(
+                    "The International GK role must be separate from country, club, staff and opt-in roles."
+                )
         if values.get("country_cap") is not None and values["country_cap"] < 1:
             raise RuleError("Country player cap must be positive, or blank for no cap.")
         if values["club_limit"] < 1:
@@ -374,20 +324,27 @@ class Engine:
         async with self.db.guild(guild.id) as con:
             async with con.transaction():
                 old = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", guild.id)
+                if goalkeeper:
+                    known_teams = await self.role_ids(con, guild.id, "country")
+                    known_teams |= await self.role_ids(con, guild.id, "club")
+                    if goalkeeper in known_teams:
+                        raise RuleError(
+                            "The International GK role must be separate from country and club roles, including disabled teams."
+                        )
                 if (
                     old
                     and old["respin_role_id"] is not None
                     and old["respin_role_id"]
                     in countries
                     | clubs
-                    | set(position_roles)
                     | {
                         values["opt_in_role_id"],
                         values["staff_role_id"],
+                        goalkeeper,
                     }
                 ):
                     raise RuleError(
-                        "The bot's Respun marker must stay separate from country, club, staff and opt-in roles."
+                        "The bot's Respun marker must stay separate from country, club, staff, opt-in and International GK roles."
                     )
                 if old and old["revision"] != expected_revision:
                     raise RuleError("Setup changed while this panel was open. Reopen /setup.")
@@ -403,9 +360,9 @@ class Engine:
                     )
                 await con.execute(
                     """INSERT INTO guild_config(guild_id,staff_role_id,opt_in_role_id,
-                  callups_channel_id,logs_channel_id,club_limit,country_cap) VALUES($1,$2,$3,$4,$5,$6,$7)
+                  callups_channel_id,logs_channel_id,club_limit,country_cap,international_gk_role_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
                   ON CONFLICT(guild_id) DO UPDATE SET staff_role_id=$2,opt_in_role_id=$3,
-                  callups_channel_id=$4,logs_channel_id=$5,club_limit=$6,country_cap=$7,
+                  callups_channel_id=$4,logs_channel_id=$5,club_limit=$6,country_cap=$7,international_gk_role_id=$8,
                   revision=guild_config.revision+1,updated_at=now()""",
                     guild.id,
                     values["staff_role_id"],
@@ -414,6 +371,7 @@ class Engine:
                     values["logs_channel_id"],
                     values["club_limit"],
                     values.get("country_cap"),
+                    goalkeeper,
                 )
                 for kind, ids in [("country", countries), ("club", clubs)]:
                     await con.execute(
@@ -426,14 +384,6 @@ class Engine:
                             guild.id,
                             role_id,
                         )
-                await con.execute("DELETE FROM position_roles WHERE guild_id=$1", guild.id)
-                for rid, group in position_roles.items():
-                    await con.execute(
-                        "INSERT INTO position_roles(guild_id,role_id,position_group) VALUES($1,$2,$3)",
-                        guild.id,
-                        rid,
-                        group,
-                    )
                 if not await self.cycle(con, guild.id):
                     await con.execute("INSERT INTO draft_cycles(guild_id) VALUES($1)", guild.id)
                 for member in guild.members:
@@ -474,13 +424,7 @@ class Engine:
                     clubs=sorted(clubs),
                     club_limit=values["club_limit"],
                     country_cap=values.get("country_cap"),
-                    positions=[
-                        {
-                            "position": group,
-                            "roles": [rid for rid, pos in position_roles.items() if pos == group],
-                        }
-                        for group in POSITION_GROUPS
-                    ],
+                    international_gk_role_id=goalkeeper,
                 )
 
     async def prepare_operation(
@@ -590,8 +534,11 @@ class Engine:
             # persisting its ID, rather than leaving duplicate marker roles behind.
             reserved = await self.role_ids(con, guild.id, "country")
             reserved |= await self.role_ids(con, guild.id, "club")
-            reserved |= set(await self.position_mapping(con, guild.id))
-            reserved |= {cfg["opt_in_role_id"], cfg["staff_role_id"]}
+            reserved |= {
+                cfg["opt_in_role_id"],
+                cfg["staff_role_id"],
+                cfg.get("international_gk_role_id"),
+            }
             role = next(
                 (
                     r
@@ -966,7 +913,7 @@ class Engine:
                     guild.id,
                 ):
                     raise RuleError("An earlier draft is still running or recovering. Run /sync.")
-                await report("Checking player eligibility, positions, and country capacity…")
+                await report("Checking player eligibility and country capacity…")
                 await self.reconcile_waitlist(con, guild)
                 rows = await con.fetch(
                     "SELECT * FROM waitlist_entries WHERE guild_id=$1 AND status='pending' ORDER BY id",
@@ -1321,17 +1268,15 @@ class Engine:
                     after.guild.id,
                     after.id,
                 )
-                position_ids = set(await self.position_mapping(con, after.guild.id))
                 club_changed = old & clubs != new & clubs
-                positions_changed = old & position_ids != new & position_ids
-                if (club_changed or positions_changed) and known:
+                if club_changed and known:
                     await self.refresh_player(con, after)
                     await self.reconcile_waitlist(con, after.guild)
                     await self.flag_capacity(con, after.guild.id)
                     await self.audit(
                         con,
                         after.guild.id,
-                        "club roles changed" if club_changed else "position roles changed",
+                        "club roles changed",
                         user=after.id,
                     )
                 if cfg["opt_in_role_id"] in new - old:

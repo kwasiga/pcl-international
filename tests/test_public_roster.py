@@ -45,7 +45,6 @@ class PublicRosterTests(unittest.IsolatedAsyncioTestCase):
                 "primary_club_role_id": None,
                 "club_conflict": False,
                 "present": True,
-                "position_groups": ["DEF", "MID"],
             }
         ]
         await self.cog.roster.callback(self.cog, self.i, "1")
@@ -55,7 +54,7 @@ class PublicRosterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.con.fetch.call_args.args[1:], (self.guild.id, 1))
         self.assertEqual(self.cog.pages.call_args.kwargs, {"staff_only": False})
         self.assertEqual(self.cog.pages.call_args.args[1], "Ghana — Active roster")
-        self.assertIn("<@123> — DEF/MID", self.cog.pages.call_args.args[2])
+        self.assertIn("<@123>", self.cog.pages.call_args.args[2])
 
     async def test_unconfigured_or_disabled_roles_rejected_before_roster_query(self):
         for country in ("2", "8", "999999999999999999999999999999999999"):

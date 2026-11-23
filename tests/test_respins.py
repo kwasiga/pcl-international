@@ -23,26 +23,6 @@ class RandomRespinTests(unittest.TestCase):
         )
         self.assertEqual(seen, [1, 2, 3])
 
-    def test_position_shortages_do_not_narrow_the_random_draw(self):
-        def choose(countries):
-            self.assertEqual(countries, [1, 2])
-            return 1
-
-        self.assertEqual(
-            choose_country(
-                [1, 2],
-                {1: 10, 2: 10},
-                {},
-                None,
-                5,
-                balance=False,
-                player_positions=["GK"],
-                position_counts={(1, "GK"): 3},
-                chooser=choose,
-            ),
-            1,
-        )
-
     def test_random_draw_keeps_caps_and_exclusions(self):
         def choose(countries):
             self.assertEqual(countries, [5, 6])
@@ -87,7 +67,6 @@ class RespinEngineTests(unittest.IsolatedAsyncioTestCase):
                 return_value={
                     "club_conflict": False,
                     "primary_club_role_id": 8,
-                    "position_groups": ["GK"],
                 }
             ),
         )
@@ -96,7 +75,6 @@ class RespinEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.cycle = AsyncMock(return_value=10)
         engine.role_ids = AsyncMock(return_value={1, 2, 3})
         engine.counts = AsyncMock(return_value=({1: 10, 2: 8, 3: 10}, {}))
-        engine.position_counts = AsyncMock()
 
         def choose(countries):
             self.assertEqual(set(countries), {2, 3})
@@ -104,4 +82,3 @@ class RespinEngineTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("bot.services.rules.secrets.choice", side_effect=choose):
             self.assertEqual(await engine.respin_target(con, member), 3)
-        engine.position_counts.assert_not_awaited()

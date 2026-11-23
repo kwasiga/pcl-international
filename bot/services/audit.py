@@ -13,6 +13,7 @@ ROLE_FIELDS = {
     "respin_role",
     "country_role_id",
     "club_role_id",
+    "international_gk_role_id",
     "from_country_id",
     "to_country_id",
 }

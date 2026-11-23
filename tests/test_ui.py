@@ -120,10 +120,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
             "countries",
             "clubs",
             "channels",
-            "pos_GK",
-            "pos_DEF",
-            "pos_MID",
-            "pos_ATT",
+            "goalkeepers",
         ):
             panel.section = section
             panel.build()
@@ -157,6 +154,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     "remove",
                     "respin",
                     "roster",
+                    "goalkeepers",
                     "history",
                     "status",
                     "sync",

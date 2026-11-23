@@ -1,7 +1,7 @@
 import discord
 
 from bot.services.permissions import require_staff
-from bot.services.rules import POSITION_GROUPS, RuleError, missing_setup
+from bot.services.rules import RuleError, missing_setup
 from bot.views.common import StaffView, reply_error
 
 
@@ -60,7 +60,7 @@ class CountryCapModal(discord.ui.Modal, title="Players per country"):
 
 
 class SetupPanel(StaffView):
-    def __init__(self, engine, owner, guild, cfg, countries, clubs, positions=None):
+    def __init__(self, engine, owner, guild, cfg, countries, clubs):
         super().__init__(engine.db, owner, admin=True, timeout=600)
         self.engine, self.guild, self.revision = engine, guild, cfg["revision"] if cfg else None
         self.values = {
@@ -71,8 +71,8 @@ class SetupPanel(StaffView):
             countries=set(countries), clubs=set(clubs), club_limit=cfg["club_limit"] if cfg else 5
         )
         self.values["country_cap"] = cfg.get("country_cap") if cfg else None
-        self.values.update(
-            {f"pos_{group}": set((positions or {}).get(group, ())) for group in POSITION_GROUPS}
+        self.values["international_gk_role_id"] = (
+            cfg.get("international_gk_role_id") if cfg else None
         )
         self.section = "overview"
         self.build()
@@ -104,10 +104,11 @@ class SetupPanel(StaffView):
         for key in ("countries", "clubs"):
             text = ", ".join(role(r) for r in sorted(v[key])) or "None"
             e.add_field(name=f"{key.title()} ({len(v[key])})", value=text[:1000], inline=False)
-        for group in POSITION_GROUPS:
-            ids = v[f"pos_{group}"]
-            text = ", ".join(role(r) for r in sorted(ids)) or "Not configured"
-            e.add_field(name=f"{group} position roles ({len(ids)})", value=text[:500], inline=False)
+        e.add_field(
+            name="International GK role",
+            value=f"{role(v['international_gk_role_id'])}\nUsed by /goalkeepers to list GKs by country and without a country.",
+            inline=False,
+        )
         e.set_footer(
             text=f"Country cap: {v['country_cap'] or 'Unlimited'} • Club limit: {v['club_limit']} • Balanced random"
         )
@@ -126,10 +127,7 @@ class SetupPanel(StaffView):
                     ("countries", "National team roles"),
                     ("clubs", "League club roles"),
                     ("channels", "Channels"),
-                    ("pos_GK", "Positions — Goalkeepers"),
-                    ("pos_DEF", "Positions — Defenders"),
-                    ("pos_MID", "Positions — Midfielders"),
-                    ("pos_ATT", "Positions — Attackers"),
+                    ("goalkeepers", "International GK role"),
                 ]
             ],
         )
@@ -144,12 +142,16 @@ class SetupPanel(StaffView):
         if self.section == "staff":
             self.role_selector("Minimum admin role", "staff_role_id", 1)
             self.role_selector("International opt-in role", "opt_in_role_id", 2)
-        elif self.section in ("countries", "clubs") or self.section.startswith("pos_"):
+        elif self.section in ("countries", "clubs"):
             self.role_selector("Add roles (repeat for more than 25)", self.section, 1, "add")
             self.role_selector("Disable/remove selected roles", self.section, 2, "remove")
         elif self.section == "channels":
             self.channel_selector("National team call-ups channel", "callups_channel_id", 1)
             self.channel_selector("Private staff logs channel", "logs_channel_id", 2)
+        elif self.section == "goalkeepers":
+            self.role_selector(
+                "International GK role (optional)", "international_gk_role_id", 1, allow_clear=True
+            )
         limit = discord.ui.Button(label="Club limit", row=3)
 
         async def edit_limit(i):
@@ -196,9 +198,12 @@ class SetupPanel(StaffView):
         cancel.callback = abandon
         self.add_item(cancel)
 
-    def role_selector(self, placeholder, key, row, mode=None):
+    def role_selector(self, placeholder, key, row, mode=None, *, allow_clear=False):
         selector = discord.ui.RoleSelect(
-            placeholder=placeholder, min_values=1, max_values=25 if mode else 1, row=row
+            placeholder=placeholder,
+            min_values=0 if allow_clear else 1,
+            max_values=25 if mode else 1,
+            row=row,
         )
 
         async def selected(i):
@@ -210,7 +215,7 @@ class SetupPanel(StaffView):
             elif mode == "remove":
                 self.values[key] -= ids
             else:
-                self.values[key] = next(iter(ids))
+                self.values[key] = next(iter(ids), None)
             await i.response.edit_message(embed=self.embed(), view=self)
 
         selector.callback = selected
