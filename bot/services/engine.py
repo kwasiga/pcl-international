@@ -180,7 +180,7 @@ class Engine:
             await self.audit(con, gid, "capacity violations", actor, violations=violations)
         return violations
 
-    async def available(self, con, guild, uid, *, excluded=()):
+    async def available(self, con, guild, uid, *, excluded=(), balance=True):
         cfg = await self.config(con, guild.id)
         player = await con.fetchrow(
             "SELECT * FROM players WHERE guild_id=$1 AND user_id=$2", guild.id, uid
@@ -205,8 +205,9 @@ class Engine:
             excluded,
             player_positions=player["position_groups"],
             country_cap=cfg.get("country_cap"),
+            balance=balance,
             position_counts=(await self.position_counts(con, guild.id, uid))
-            if player["position_groups"]
+            if balance and player["position_groups"]
             else None,
         )
 
@@ -837,7 +838,11 @@ class Engine:
             uid,
         )
         return await self.available(
-            con, member.guild, uid, excluded={current} | {r["country_role_id"] for r in used}
+            con,
+            member.guild,
+            uid,
+            excluded={current} | {r["country_role_id"] for r in used},
+            balance=False,
         )
 
     async def propose_respin(self, member):
@@ -858,7 +863,11 @@ class Engine:
                     # Evaluate capacity without relaxing the club rule.
                     if (
                         await self.available(
-                            con, member.guild, member.id, excluded=countries - {cid}
+                            con,
+                            member.guild,
+                            member.id,
+                            excluded=countries - {cid},
+                            balance=False,
                         )
                         == cid
                     ):

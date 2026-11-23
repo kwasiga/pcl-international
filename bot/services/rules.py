@@ -27,6 +27,7 @@ def choose_country(
     player_positions=(),
     position_counts=None,
     country_cap=None,
+    balance=True,
 ):
     eligible = [
         c
@@ -37,6 +38,10 @@ def choose_country(
     ]
     if not eligible:
         return None
+    if not balance:
+        # Respins draw from every eligible country, rather than always filling
+        # the smallest country or the last vacancy left by another respin.
+        return (chooser or secrets.choice)(eligible)
     smallest = min(population.get(c, 0) for c in eligible)
     candidates = [c for c in eligible if population.get(c, 0) == smallest]
     positions = set(player_positions)
