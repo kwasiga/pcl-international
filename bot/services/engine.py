@@ -3,6 +3,8 @@
 import json
 import logging
 import secrets
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import discord
 
@@ -11,6 +13,7 @@ from bot.services.permissions import require_staff
 from bot.services.roles import apply_roles, validate_role
 from bot.services.rules import (
     RuleError,
+    BotPausedError,
     callup_chunks,
     choose_country,
     occupancy,
@@ -27,16 +30,100 @@ class Engine:
     def __init__(self, db, bot):
         self.db, self.bot = db, bot
 
-    async def config(self, con, gid, *, allow_reset=False, required=()):
+    async def config(self, con, gid, *, allow_reset=False, allow_paused=False, required=()):
         cfg = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", gid)
         if not cfg:
             raise RuleError("An Administrator must run /setup first.")
+        if cfg.get("paused", False) and not allow_paused:
+            raise BotPausedError()
         if cfg["resetting"] and not allow_reset:
             raise RuleError("A reset is in progress. Use /status or /sync to inspect recovery.")
         missing = [SETUP_LABELS.get(key, key) for key in required if not cfg[key]]
         if missing:
             raise RuleError("Finish these settings in /setup first: " + ", ".join(missing) + ".")
         return cfg
+
+    async def is_paused(self, con, gid):
+        return bool(await con.fetchval("SELECT paused FROM guild_config WHERE guild_id=$1", gid))
+
+    async def set_paused(self, guild, actor, paused):
+        # Deliberately avoid the long-running guild lock so /pause can interrupt
+        # a draft between players rather than waiting for the entire batch.
+        async with self.db.pool.acquire() as con:
+            async with con.transaction():
+                await self.config(con, guild.id, allow_reset=True, allow_paused=True)
+                admin = guild.get_member(actor) or await guild.fetch_member(actor)
+                await require_staff(self.db, admin, admin=True, connection=con)
+                changed = await con.fetchval(
+                    "UPDATE guild_config SET paused=$2,paused_by=CASE WHEN $2 THEN $3::bigint ELSE NULL END,"
+                    "paused_at=CASE WHEN $2 THEN now() ELSE NULL END,revision=revision+1,updated_at=now() "
+                    "WHERE guild_id=$1 AND paused <> $2 RETURNING guild_id",
+                    guild.id,
+                    paused,
+                    actor,
+                )
+                if changed:
+                    await self.audit(
+                        con, guild.id, "bot paused" if paused else "bot resumed", actor
+                    )
+                return bool(changed)
+
+    async def defer_member_event(self, con, gid, uid, restore=False):
+        await con.execute(
+            "INSERT INTO paused_member_events(guild_id,user_id,needs_restore) VALUES($1,$2,$3) "
+            "ON CONFLICT(guild_id,user_id) DO UPDATE SET "
+            "needs_restore=paused_member_events.needs_restore OR EXCLUDED.needs_restore,"
+            "version=paused_member_events.version+1",
+            gid,
+            uid,
+            restore,
+        )
+
+    async def defer_event(self, member, *, restore=False):
+        async with self.db.guild(member.guild.id) as con:
+            await self.defer_member_event(con, member.guild.id, member.id, restore)
+
+    @asynccontextmanager
+    async def event_connection(self, gid, connection=None):
+        if connection is not None:
+            yield connection
+        else:
+            async with self.db.guild(gid) as con:
+                yield con
+
+    async def replay_member_events(self, con, guild):
+        rows = await con.fetch(
+            "SELECT * FROM paused_member_events WHERE guild_id=$1 ORDER BY user_id", guild.id
+        )
+        for row in rows:
+            if await self.is_paused(con, guild.id):
+                return
+            member = guild.get_member(row["user_id"])
+            if member is None:
+                await self.member_left(
+                    SimpleNamespace(guild=guild, id=row["user_id"]), connection=con
+                )
+            elif row["needs_restore"]:
+                await self.member_joined(member, connection=con)
+            else:
+                await self.refresh_player(con, member)
+                cfg = await self.config(con, guild.id, allow_reset=True)
+                if any(role.id == cfg["opt_in_role_id"] for role in member.roles):
+                    try:
+                        await self.enqueue(con, member, "opt_in", refresh=True)
+                    except BotPausedError:
+                        raise
+                    except RuleError:
+                        pass  # An unfinished operation still owns this player's reservation.
+            await con.execute(
+                "DELETE FROM paused_member_events WHERE guild_id=$1 AND user_id=$2 AND version=$3",
+                guild.id,
+                row["user_id"],
+                row["version"],
+            )
+        if rows:
+            await self.config(con, guild.id, allow_reset=True)
+            await self.reconcile_waitlist(con, guild)
 
     async def cycle(self, con, gid):
         return await con.fetchval(
@@ -324,6 +411,8 @@ class Engine:
         async with self.db.guild(guild.id) as con:
             async with con.transaction():
                 old = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", guild.id)
+                if old and old.get("paused", False):
+                    raise BotPausedError()
                 if goalkeeper:
                     known_teams = await self.role_ids(con, guild.id, "country")
                     known_teams |= await self.role_ids(con, guild.id, "club")
@@ -525,7 +614,7 @@ class Engine:
         return opid
 
     async def ensure_respin_role(self, con, guild):
-        cfg = await self.config(con, guild.id, allow_reset=True)
+        cfg = await self.config(con, guild.id, allow_reset=True, allow_paused=True)
         role = guild.get_role(cfg["respin_role_id"]) if cfg["respin_role_id"] else None
         if role is None:
             if not guild.me or not guild.me.guild_permissions.manage_roles:
@@ -569,8 +658,10 @@ class Engine:
         op = await con.fetchrow("SELECT * FROM role_operations WHERE id=$1", opid)
         if op["status"] == "completed":
             return True
+        cfg = await self.config(con, guild.id, allow_reset=True, allow_paused=True)
+        if cfg.get("paused", False):
+            raise BotPausedError()
         try:
-            cfg = await self.config(con, guild.id, allow_reset=True)
             already_respun = await con.fetchval(
                 "SELECT has_respun FROM players WHERE guild_id=$1 AND user_id=$2",
                 guild.id,
@@ -716,7 +807,7 @@ class Engine:
                     uid,
                 )
             if target:
-                cfg = await self.config(con, gid, allow_reset=True)
+                cfg = await self.config(con, gid, allow_reset=True, allow_paused=True)
                 old = op["from_country_id"]
                 if old:
                     previous = f" from <@&{old}>" if old != target else ""
@@ -966,6 +1057,8 @@ class Engine:
             return succeeded, len(ops) - succeeded
 
     async def finish_batches(self, con, guild):
+        if await self.is_paused(con, guild.id):
+            return
         batches = await con.fetch(
             "SELECT id FROM draft_batches WHERE guild_id=$1 AND status='processing'", guild.id
         )
@@ -1217,8 +1310,8 @@ class Engine:
             )
 
     async def finish_reset(self, con, guild):
-        cfg = await self.config(con, guild.id, allow_reset=True)
-        if not cfg["resetting"]:
+        cfg = await self.config(con, guild.id, allow_reset=True, allow_paused=True)
+        if cfg.get("paused", False) or not cfg["resetting"]:
             return
         if await con.fetchval(
             "SELECT 1 FROM role_operations WHERE guild_id=$1 AND action='reset' AND status <> 'completed'",
@@ -1239,24 +1332,38 @@ class Engine:
             await self.audit(con, guild.id, "reset completed")
 
     async def recover_locked(self, con, guild):
+        if await self.is_paused(con, guild.id):
+            return
         ops = await con.fetch(
             "SELECT id FROM role_operations WHERE guild_id=$1 AND status IN ('pending','failed') ORDER BY id",
             guild.id,
         )
-        for op in ops:
-            await self.execute_operation(con, guild, op["id"])
-        await self.finish_batches(con, guild)
-        await self.finish_reset(con, guild)
+        try:
+            for op in ops:
+                await self.execute_operation(con, guild, op["id"])
+            await self.finish_batches(con, guild)
+            await self.finish_reset(con, guild)
+            if not await self.is_paused(con, guild.id) and not await con.fetchval(
+                "SELECT resetting FROM guild_config WHERE guild_id=$1", guild.id
+            ):
+                await self.replay_member_events(con, guild)
+        except BotPausedError:
+            return  # A new pause preserves all remaining operations/events for /resume.
 
     async def recover(self, guild):
         async with self.db.guild(guild.id) as con:
             if await con.fetchval("SELECT 1 FROM guild_config WHERE guild_id=$1", guild.id):
                 await self.recover_locked(con, guild)
 
-    async def member_update(self, before, after):
-        async with self.db.guild(after.guild.id) as con:
+    async def member_update(self, before, after, *, connection=None):
+        async with self.event_connection(after.guild.id, connection) as con:
             cfg = await con.fetchrow("SELECT * FROM guild_config WHERE guild_id=$1", after.guild.id)
-            if not cfg or cfg["resetting"] or after.bot:
+            if not cfg or after.bot:
+                return
+            if cfg.get("paused", False):
+                await self.defer_member_event(con, after.guild.id, after.id)
+                return
+            if cfg["resetting"]:
                 return
             old, new = {r.id for r in before.roles}, {r.id for r in after.roles}
             if old == new:
@@ -1282,6 +1389,8 @@ class Engine:
                 if cfg["opt_in_role_id"] in new - old:
                     try:
                         await self.enqueue(con, after, "opt_in")
+                    except BotPausedError:
+                        raise
                     except RuleError:
                         pass  # Already assigned/waitlisted; opt-in is idempotent.
                 managed = await self.role_ids(con, after.guild.id, "country")
@@ -1307,8 +1416,11 @@ class Engine:
                             actual=sorted(new & managed),
                         )
 
-    async def member_left(self, member):
-        async with self.db.guild(member.guild.id) as con:
+    async def member_left(self, member, *, connection=None):
+        async with self.event_connection(member.guild.id, connection) as con:
+            if await self.is_paused(con, member.guild.id):
+                await self.defer_member_event(con, member.guild.id, member.id)
+                return
             async with con.transaction():
                 await con.execute(
                     "UPDATE players SET present=FALSE WHERE guild_id=$1 AND user_id=$2",
@@ -1323,12 +1435,17 @@ class Engine:
                     member.id,
                 )
 
-    async def member_joined(self, member):
-        async with self.db.guild(member.guild.id) as con:
+    async def member_joined(self, member, *, connection=None):
+        async with self.event_connection(member.guild.id, connection) as con:
             cfg = await con.fetchrow(
                 "SELECT * FROM guild_config WHERE guild_id=$1", member.guild.id
             )
-            if not cfg or cfg["resetting"] or member.bot:
+            if not cfg or member.bot:
+                return
+            if cfg.get("paused", False):
+                await self.defer_member_event(con, member.guild.id, member.id, True)
+                return
+            if cfg["resetting"]:
                 return
             await self.refresh_player(con, member)
             op = await con.fetchval(
@@ -1368,11 +1485,15 @@ class Engine:
 
     async def flush_outbox(self, guild):
         async with self.db.guild(guild.id) as con:
+            if await self.is_paused(con, guild.id):
+                return
             rows = await con.fetch(
                 "SELECT * FROM announcement_outbox WHERE guild_id=$1 AND status='pending' ORDER BY id LIMIT 50",
                 guild.id,
             )
             for row in rows:
+                if await self.is_paused(con, guild.id):
+                    return
                 try:
                     channel = guild.get_channel(row["channel_id"]) or await self.bot.fetch_channel(
                         row["channel_id"]
@@ -1406,6 +1527,8 @@ class Engine:
         needs_marker = player["has_respun"] and cfg["respin_role_id"] not in held
         if cfg["opt_in_role_id"] not in held and not needs_marker:
             return
+        if await self.is_paused(con, guild.id):
+            raise BotPausedError()
         if await con.fetchval(
             "SELECT 1 FROM role_operations WHERE guild_id=$1 AND user_id=$2 "
             "AND status IN ('pending','failed')",
@@ -1446,6 +1569,7 @@ class Engine:
                 for p in await con.fetch("SELECT * FROM players WHERE guild_id=$1", guild.id)
             }
             for member in guild.members:
+                await self.config(con, guild.id, allow_reset=True)
                 if member.id in players:
                     await self.refresh_player(con, member)
                 actual = {r.id for r in member.roles} & managed

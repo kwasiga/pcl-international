@@ -285,7 +285,7 @@ class StaffCommands(commands.Cog):
             role = i.guild.get_role(country_id)
             if country_id not in configured or role is None:
                 raise RuleError("Choose a country from the configured national team list.")
-            cfg = await self.engine.config(con, i.guild_id, allow_reset=True)
+            cfg = await self.engine.config(con, i.guild_id, allow_reset=True, allow_paused=True)
             rows = await con.fetch(
                 "SELECT user_id,primary_club_role_id,club_conflict,present FROM players "
                 "WHERE guild_id=$1 AND current_country_role_id=$2 ORDER BY primary_club_role_id NULLS LAST,user_id",
@@ -339,7 +339,7 @@ class StaffCommands(commands.Cog):
         if i.guild is None:
             raise RuleError("Use this command inside your Discord server.")
         async with self.db.pool.acquire() as con:
-            cfg = await self.engine.config(con, i.guild_id, allow_reset=True)
+            cfg = await self.engine.config(con, i.guild_id, allow_reset=True, allow_paused=True)
             goalkeeper = cfg.get("international_gk_role_id")
             if not goalkeeper or i.guild.get_role(goalkeeper) is None:
                 raise RuleError("Select the International GK role in /setup first.")
@@ -434,7 +434,7 @@ class StaffCommands(commands.Cog):
     async def status(self, i: discord.Interaction):
         await self.check(i)
         async with self.db.pool.acquire() as con:
-            cfg = await self.engine.config(con, i.guild_id, allow_reset=True)
+            cfg = await self.engine.config(con, i.guild_id, allow_reset=True, allow_paused=True)
             cycle = await self.engine.cycle(con, i.guild_id)
             active = await con.fetchval(
                 "SELECT count(*) FROM players WHERE guild_id=$1 AND current_country_role_id IS NOT NULL",
@@ -457,6 +457,9 @@ class StaffCommands(commands.Cog):
             _, occupancy = await self.engine.counts(con, i.guild_id)
             violations = sum(n > cfg["club_limit"] for n in occupancy.values())
         lines = [
+            "Bot: **PAUSED** — use /resume to continue."
+            if cfg.get("paused", False)
+            else "Bot: **RUNNING**",
             f"Cycle: **{cycle}**" + (" — **RESET RECOVERY**" if cfg["resetting"] else ""),
             f"Active players: **{active}**",
             f"Player cap per country: **{cfg.get('country_cap') or 'Unlimited'}**",
@@ -467,6 +470,30 @@ class StaffCommands(commands.Cog):
         lines.extend(f"{r['status']}: **{r['n']}**" for r in counts)
         lines.append("Use /sync for a current Discord/database discrepancy report.")
         await self.pages(i, "PCL International — Status", lines)
+
+    @app_commands.command(description="Pause actions, role changes, and queued announcements")
+    @app_commands.guild_only()
+    async def pause(self, i: discord.Interaction):
+        await self.check(i, True)
+        changed = await self.engine.set_paused(i.guild, i.user.id, True)
+        await i.followup.send(
+            ("**Bot paused.**" if changed else "**Bot is already paused.**")
+            + " No new actions will start. A player operation already in progress may finish safely. "
+            "Pending work is preserved; an admin can use /resume.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(description="Resume actions and pending work after a pause")
+    @app_commands.guild_only()
+    async def resume(self, i: discord.Interaction):
+        await self.check(i, True)
+        changed = await self.engine.set_paused(i.guild, i.user.id, False)
+        self.bot.boot_reconciled.discard(i.guild_id)
+        await i.followup.send(
+            ("**Bot resumed.**" if changed else "**Bot is already running.**")
+            + " Pending work, member updates, and queued announcements will continue automatically.",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="sync", description="Retry unfinished operations and report role discrepancies"

@@ -5,63 +5,93 @@ from bot.services.rules import RuleError, missing_setup
 from bot.views.common import StaffView, reply_error
 
 
-class ClubLimitModal(discord.ui.Modal, title="Club limit"):
+class SetupValueModal(discord.ui.Modal):
+    def __init__(self, panel):
+        super().__init__(timeout=600)
+        self.panel = panel
+
+    async def check_submission(self, interaction):
+        # Modal submissions have the same short acknowledgement deadline as commands.
+        # Close the form before waiting on a potentially busy database.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.panel.closed or self.panel.is_finished():
+            raise RuleError("This setup panel has expired or was closed. Run /setup again.")
+        if interaction.user.id != self.panel.owner:
+            raise RuleError("Only the staff member who opened this panel can use it.")
+        await require_staff(self.panel.db, interaction.user, admin=True)
+
+    async def apply_value(self, interaction, key, value, description):
+        message = self.panel.message or getattr(interaction, "message", None)
+        if message is None:
+            raise RuleError("The setup message is unavailable. Run /setup again.")
+        previous = self.panel.values[key]
+        self.panel.values[key] = value
+        try:
+            # This is the setup message, not the modal's deferred confirmation message.
+            await message.edit(embed=self.panel.embed(), view=self.panel)
+        except Exception:
+            self.panel.values[key] = previous
+            raise
+        await interaction.edit_original_response(
+            content=f"{description}. Return to the setup panel and press **Save** to apply it."
+        )
+
+    async def on_error(self, interaction, error):
+        await reply_error(interaction, error, replace_original=True)
+
+
+class ClubLimitModal(SetupValueModal, title="Club limit"):
     value = discord.ui.TextInput(label="Maximum club players per country", max_length=5)
 
     def __init__(self, panel):
-        super().__init__()
-        self.panel = panel
+        super().__init__(panel)
         self.value.default = str(panel.values["club_limit"])
 
     async def on_submit(self, interaction):
-        if not await self.panel.interaction_check(interaction):
-            return
+        await self.check_submission(interaction)
         try:
             limit = int(self.value.value)
             if limit < 1:
                 raise ValueError
         except ValueError:
-            return await interaction.response.send_message(
-                "Enter a positive whole number.", ephemeral=True
+            return await interaction.edit_original_response(
+                content="Enter a positive whole number. Reopen Club limit to try again."
             )
-        self.panel.values["club_limit"] = limit
-        await interaction.response.edit_message(embed=self.panel.embed(), view=self.panel)
-
-    async def on_error(self, interaction, error):
-        await reply_error(interaction, error)
+        await self.apply_value(interaction, "club_limit", limit, f"Club limit set to **{limit}**")
 
 
-class CountryCapModal(discord.ui.Modal, title="Players per country"):
+class CountryCapModal(SetupValueModal, title="Players per country"):
     value = discord.ui.TextInput(
         label="Maximum players (blank = no cap)", required=False, max_length=5
     )
 
     def __init__(self, panel):
-        super().__init__()
-        self.panel = panel
+        super().__init__(panel)
         self.value.default = str(panel.values["country_cap"] or "")
 
     async def on_submit(self, interaction):
-        if not await self.panel.interaction_check(interaction):
-            return
+        await self.check_submission(interaction)
         try:
             cap = int(self.value.value.strip()) if self.value.value.strip() else None
             if cap is not None and cap < 1:
                 raise ValueError
         except ValueError:
-            return await interaction.response.send_message(
-                "Enter a positive whole number, or leave blank for no cap.", ephemeral=True
+            return await interaction.edit_original_response(
+                content="Enter a positive whole number, or leave blank for no cap. "
+                "Reopen Country player cap to try again."
             )
-        self.panel.values["country_cap"] = cap
-        await interaction.response.edit_message(embed=self.panel.embed(), view=self.panel)
-
-    async def on_error(self, interaction, error):
-        await reply_error(interaction, error)
+        description = (
+            f"Country player cap set to **{cap}**"
+            if cap is not None
+            else "Country player cap removed"
+        )
+        await self.apply_value(interaction, "country_cap", cap, description)
 
 
 class SetupPanel(StaffView):
     def __init__(self, engine, owner, guild, cfg, countries, clubs):
         super().__init__(engine.db, owner, admin=True, timeout=600)
+        self.closed = False
         self.engine, self.guild, self.revision = engine, guild, cfg["revision"] if cfg else None
         self.values = {
             k: cfg[k] if cfg else None
@@ -76,6 +106,14 @@ class SetupPanel(StaffView):
         )
         self.section = "overview"
         self.build()
+
+    def stop(self):
+        self.closed = True
+        super().stop()
+
+    async def on_timeout(self):
+        self.closed = True
+        await super().on_timeout()
 
     def embed(self):
         v = self.values

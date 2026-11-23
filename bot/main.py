@@ -10,6 +10,7 @@ from bot.commands import StaffCommands
 from bot.config import Settings
 from bot.database.connection import Database
 from bot.services.engine import Engine
+from bot.services.rules import BotPausedError
 
 log = logging.getLogger("pcl")
 
@@ -43,18 +44,30 @@ class PCLInternational(commands.Bot):
         log.info("PCL International connected as %s in %s server(s)", self.user, len(self.guilds))
 
     async def on_member_update(self, before, after):
-        await self.engine.member_update(before, after)
+        try:
+            await self.engine.member_update(before, after)
+        except BotPausedError:
+            await self.engine.defer_event(after)
 
     async def on_member_remove(self, member):
-        await self.engine.member_left(member)
+        try:
+            await self.engine.member_left(member)
+        except BotPausedError:
+            await self.engine.defer_event(member)
 
     async def on_member_join(self, member):
-        await self.engine.member_joined(member)
+        try:
+            await self.engine.member_joined(member)
+        except BotPausedError:
+            await self.engine.defer_event(member, restore=True)
 
     @tasks.loop(seconds=60)
     async def maintenance(self):
         for guild in self.guilds:
             try:
+                async with self.db.pool.acquire() as con:
+                    if await self.engine.is_paused(con, guild.id):
+                        continue
                 if not guild.chunked:
                     await guild.chunk()
                 await self.engine.recover(guild)
@@ -68,6 +81,8 @@ class PCLInternational(commands.Bot):
                         await self.engine.sync(guild)
                     self.boot_reconciled.add(guild.id)
                 await self.engine.flush_outbox(guild)
+            except BotPausedError:
+                continue
             except Exception:
                 log.exception("Maintenance failed for guild %s; retrying next minute", guild.id)
 

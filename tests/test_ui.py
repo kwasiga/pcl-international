@@ -160,6 +160,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     "sync",
                     "reset",
                     "clear",
+                    "pause",
+                    "resume",
                 },
             )
             for command in bot.tree.get_commands():

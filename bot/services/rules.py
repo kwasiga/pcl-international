@@ -6,6 +6,14 @@ class RuleError(Exception):
     """A safe, user-facing explanation of an invalid operation."""
 
 
+class BotPausedError(RuleError):
+    def __init__(self):
+        super().__init__(
+            "PCL International is paused. Pending work is preserved. "
+            "An admin must use /resume before actions can continue."
+        )
+
+
 RESPIN_LIMIT = 3
 
 

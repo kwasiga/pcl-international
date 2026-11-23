@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot.database.connection import Database
 from bot.services.engine import Engine
-from bot.services.rules import RuleError
+from bot.services.rules import BotPausedError, RuleError
 
 
 class Role:
@@ -149,6 +149,93 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             return_exceptions=True,
         )
         self.assertTrue(all(isinstance(r, RuleError) for r in results))
+
+    async def test_pause_persists_across_restart_and_holds_outbox_until_resume(self):
+        member = self.guild.player(100)
+        self.guild.player(77, (20,))
+        await self.engine.assign(member, 1, 77)
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            self.assertTrue(await self.engine.set_paused(self.guild, 77, True))
+            self.assertFalse(await self.engine.set_paused(self.guild, 77, True))
+        restarted = Engine(self.db, self.engine.bot)
+        with self.assertRaises(BotPausedError):
+            await restarted.register(self.guild.player(101))
+        await restarted.recover(self.guild)
+        await restarted.flush_outbox(self.guild)
+        self.guild.channel.send.assert_not_awaited()
+        self.assertTrue(await self.fetchval("SELECT paused FROM guild_config"))
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 1)
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            self.assertTrue(await restarted.set_paused(self.guild, 77, False))
+        await restarted.flush_outbox(self.guild)
+        self.assertFalse(await self.fetchval("SELECT paused FROM guild_config"))
+        messages = [c.args[0] for c in self.guild.channel.send.call_args_list]
+        self.assertEqual(sum("has been assigned to" in m for m in messages), 1)
+
+    async def test_running_draft_stops_between_players_and_recovers_after_resume(self):
+        self.guild.player(77, (20,))
+        for uid in (100, 101, 102):
+            await self.engine.register(self.guild.player(uid))
+        original = self.engine.execute_operation
+        completed = 0
+
+        async def execute(con, guild, opid):
+            nonlocal completed
+            result = await original(con, guild, opid)
+            completed += 1
+            if completed == 1:
+                with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+                    await self.engine.set_paused(guild, 77, True)
+            return result
+
+        self.engine.execute_operation = execute
+        with self.assertRaises(BotPausedError):
+            await asyncio.wait_for(self.engine.draft(self.guild, 77), timeout=10)
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 1
+        )
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM role_operations WHERE status='pending'"), 2
+        )
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM role_operations WHERE status='failed'"), 0
+        )
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await self.engine.set_paused(self.guild, 77, False)
+        await self.engine.recover(self.guild)
+        await self.engine.recover(self.guild)
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 3
+        )
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 3)
+        self.assertEqual(await self.fetchval("SELECT status FROM draft_batches"), "completed")
+
+    async def test_member_events_received_while_paused_replay_on_resume(self):
+        returning = self.guild.player(100)
+        self.guild.player(77, (20,))
+        await self.engine.assign(returning, 1, 77)
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await self.engine.set_paused(self.guild, 77, True)
+        await self.engine.member_left(returning)
+        returning.roles = [self.guild.get_role(8)]
+        await self.engine.member_joined(returning)
+        opted = self.guild.player(101, (8, 21))
+        await self.engine.member_update(SimpleNamespace(roles=[self.guild.get_role(8)]), opted)
+        self.assertNotIn(self.guild.get_role(1), returning.roles)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM paused_member_events"), 2)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM players WHERE user_id=101"), 0)
+        restarted = Engine(self.db, self.engine.bot)
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await restarted.set_paused(self.guild, 77, False)
+        await restarted.recover(self.guild)
+        self.assertIn(self.guild.get_role(1), returning.roles)
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=101"), "pending"
+        )
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM paused_member_events"), 0)
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignment_history WHERE user_id=100"), 1
+        )
 
     async def test_manual_registration_without_optin_and_multiclub_block(self):
         self.assertEqual(await self.engine.register(self.guild.player(100, ())), "pending")
