@@ -30,16 +30,17 @@ class StaffCommands(commands.Cog):
         await reply_error(interaction, getattr(error, "original", error))
 
     async def check(self, i, admin=False):
-        await require_staff(self.db, i.user, admin=admin)
+        # Acknowledge first so a busy database cannot expire Discord's initial response.
         await i.response.defer(ephemeral=True)
+        await require_staff(self.db, i.user, admin=admin)
 
     async def pages(self, i, title, lines):
         view = Pages(self.db, i.user.id, title, lines)
         await i.followup.send(embed=view.embed(), view=view, ephemeral=True)
         view.message = await i.original_response()
 
-    async def confirm(self, i, text, action, admin=False):
-        view = Confirmation(self.db, i.user.id, action, admin=admin)
+    async def confirm(self, i, text, action, admin=False, *, progress=False):
+        view = Confirmation(self.db, i.user.id, action, admin=admin, progress=progress)
         await i.followup.send(text, view=view, ephemeral=True)
         view.message = await i.original_response()
 
@@ -110,7 +111,7 @@ class StaffCommands(commands.Cog):
             "Waitlist entry removed." if removed else "No pending entry found.", ephemeral=True
         )
 
-    @draft.command(name="run", description="Assign pending players; hold squad announcements")
+    @draft.command(name="run", description="Assign pending players and announce each assignment")
     async def draft_run(self, i: discord.Interaction):
         await self.check(i)
         async with self.db.pool.acquire() as con:
@@ -123,20 +124,28 @@ class StaffCommands(commands.Cog):
         text = "Confirm the official draft? All eligible pending players will be processed.\n"
         text += "\n".join(f"**{r['status']}:** {r['n']}" for r in counts) or "No pending players."
         text += "\nEligibility and capacity are checked again before freezing the batch."
-        text += "\nSquad announcements are held until you use /draft country."
+        text += "\nEach successful assignment will be announced in the call-ups channel."
 
-        async def run(click):
-            success, failed = await self.engine.draft(i.guild, click.user.id)
+        async def run(click, report):
+            success, failed = await self.engine.draft(i.guild, click.user.id, progress=report)
             result = f"Draft finished: **{success} successful**, **{failed} awaiting retry**."
             if success:
-                result += " Use /draft country to reveal one country's full squad at a time."
+                await report(
+                    f"**{success} successful**, **{failed} awaiting retry**. "
+                    "Publishing assignment announcements…"
+                )
+                await self.engine.flush_outbox(i.guild)
+                result += (
+                    " Successful assignments are queued for the call-ups channel. "
+                    "Use /draft country for a separate full-squad announcement."
+                )
             if failed:
                 result += (
                     " Check the staff logs, resolve the reported issue, then run /sync to retry."
                 )
             return result
 
-        await self.confirm(i, text, run)
+        await self.confirm(i, text, run, progress=True)
 
     @draft.command(
         name="country", description="Reveal one full squad; omit country for a random one"

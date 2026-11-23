@@ -1,4 +1,5 @@
 import asyncio
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from bot.config import Settings
 class Database:
     def __init__(self, pool):
         self.pool = pool
+        self._guild_locks = defaultdict(asyncio.Lock)
 
     @classmethod
     async def connect(cls, url):
@@ -40,12 +42,15 @@ class Database:
     async def guild(self, guild_id):
         # Session lock spans committed journal writes AND remote role changes. This requires
         # a direct Postgres connection, not transaction-mode PgBouncer.
-        async with self.pool.acquire() as con:
-            await con.execute("SELECT pg_advisory_lock($1)", guild_id)
-            try:
-                yield con
-            finally:
-                await asyncio.shield(con.execute("SELECT pg_advisory_unlock($1)", guild_id))
+        # Role updates emitted during a draft must queue before acquiring a connection.
+        # Otherwise waiting events can occupy the entire pool and block staff commands.
+        async with self._guild_locks[guild_id]:
+            async with self.pool.acquire() as con:
+                await con.execute("SELECT pg_advisory_lock($1)", guild_id)
+                try:
+                    yield con
+                finally:
+                    await asyncio.shield(con.execute("SELECT pg_advisory_unlock($1)", guild_id))
 
     async def close(self):
         await self.pool.close()

@@ -1,4 +1,7 @@
+import asyncio
 import logging
+import time
+from contextlib import suppress
 
 import discord
 
@@ -8,13 +11,19 @@ from bot.services.rules import RuleError
 log = logging.getLogger(__name__)
 
 
-async def reply_error(interaction, error):
+async def reply_error(interaction, error, *, replace_original=False):
     if isinstance(error, RuleError):
         message = str(error)
     else:
         log.error("Interaction failed (%s)", type(error).__name__, exc_info=error)
         message = "The operation could not finish. Check /status or /sync before retrying."
     if interaction.response.is_done():
+        if replace_original:
+            try:
+                await interaction.edit_original_response(content=message, view=None, embed=None)
+                return
+            except discord.HTTPException:
+                pass
         await interaction.followup.send(message, ephemeral=True)
     else:
         await interaction.response.send_message(message, ephemeral=True)
@@ -50,9 +59,32 @@ class StaffView(discord.ui.View):
 
 
 class Confirmation(StaffView):
-    def __init__(self, db, owner, action, *, admin=False):
+    def __init__(self, db, owner, action, *, admin=False, progress=False):
         super().__init__(db, owner, admin=admin)
         self.action, self.claimed = action, False
+        self.progress = progress
+        self.progress_text = "Starting draft…"
+
+    async def report_progress(self, text):
+        self.progress_text = text
+
+    async def show_progress(self, interaction):
+        started = time.monotonic()
+        while True:
+            try:
+                await interaction.edit_original_response(
+                    content=f"{self.progress_text}\nElapsed: {int(time.monotonic() - started)}s. "
+                    "Large drafts may take several minutes. Do not start another draft.",
+                    view=None,
+                    embed=None,
+                )
+            except discord.HTTPException:
+                log.warning("Could not update draft progress; processing continues", exc_info=True)
+                return
+            await asyncio.sleep(5)
+
+    async def on_error(self, interaction, error, item):
+        await reply_error(interaction, error, replace_original=True)
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction, button):
@@ -63,11 +95,22 @@ class Confirmation(StaffView):
         self.claimed = True
         for item in self.children:
             item.disabled = True
-        await interaction.response.edit_message(content="Working…", view=self)
+        await interaction.response.edit_message(content="Working…", view=None, embed=None)
         self.stop()
-        # Checks are repeated here to guard against permission changes after panel creation.
-        await require_staff(self.db, interaction.user, admin=self.admin)
-        text = await self.action(interaction)
+        reporter = asyncio.create_task(self.show_progress(interaction)) if self.progress else None
+        try:
+            # Recheck permission changes after panel creation.
+            await require_staff(self.db, interaction.user, admin=self.admin)
+            text = (
+                await self.action(interaction, self.report_progress)
+                if self.progress
+                else await self.action(interaction)
+            )
+        finally:
+            if reporter:
+                reporter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reporter
         await interaction.edit_original_response(content=text, view=None, embed=None)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)

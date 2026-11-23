@@ -173,6 +173,12 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await self.fetchval("SELECT count(*) FROM role_operations WHERE status='failed'"), 1
         )
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM announcement_outbox WHERE dedupe_key LIKE 'operation:%'"
+            ),
+            1,
+        )
         failed.fail = False
         await self.engine.recover(self.guild)
         await self.engine.recover(self.guild)
@@ -202,6 +208,14 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(sum(m.count("<@100>") for m in messages), 1)
         self.assertEqual(sum(m.count("<@101>") for m in messages), 1)
+        assignments = [
+            c.args[0]
+            for c in self.guild.channel.send.call_args_list
+            if "has been assigned to" in c.args[0]
+        ]
+        self.assertEqual(len(assignments), 2)
+        self.assertEqual(sum(m.count("<@100>") for m in assignments), 1)
+        self.assertEqual(sum(m.count("<@101>") for m in assignments), 1)
 
     async def test_crash_after_discord_before_database_recovers(self):
         member = self.guild.player(100)

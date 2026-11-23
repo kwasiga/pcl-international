@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,7 +15,10 @@ def interaction(uid=10):
     return SimpleNamespace(
         user=SimpleNamespace(id=uid),
         response=SimpleNamespace(
-            edit_message=AsyncMock(), send_message=AsyncMock(), is_done=lambda: False
+            edit_message=AsyncMock(),
+            send_message=AsyncMock(),
+            defer=AsyncMock(),
+            is_done=lambda: False,
         ),
         edit_original_response=AsyncMock(),
         followup=SimpleNamespace(send=AsyncMock()),
@@ -53,6 +57,60 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await panel.interaction_check(interaction(11)))
         panel.action.assert_not_awaited()
         staff.assert_not_awaited()
+
+    @patch("bot.views.common.require_staff", new_callable=AsyncMock)
+    async def test_long_draft_shows_live_progress_then_final_result(self, staff):
+        updated, finish = asyncio.Event(), asyncio.Event()
+        i = interaction()
+
+        async def edit(**kwargs):
+            if "2/5 players" in kwargs["content"]:
+                updated.set()
+
+        async def action(click, report):
+            await report("Assigning: **2/5 players**")
+            await finish.wait()
+            return "Draft finished: 5 successful."
+
+        i.edit_original_response.side_effect = edit
+        panel = Confirmation(MagicMock(), 10, action, progress=True)
+        task = asyncio.create_task(panel.children[0].callback(i))
+        try:
+            await asyncio.wait_for(updated.wait(), timeout=1)
+            self.assertFalse(task.done())
+        finally:
+            finish.set()
+            await task
+        self.assertEqual(
+            i.edit_original_response.call_args.kwargs["content"], "Draft finished: 5 successful."
+        )
+        self.assertIsNone(i.edit_original_response.call_args.kwargs["view"])
+
+    @patch("bot.views.common.require_staff", new_callable=AsyncMock)
+    async def test_confirmation_error_replaces_working_message(self, staff):
+        panel = Confirmation(
+            MagicMock(), 10, AsyncMock(side_effect=RuleError("No eligible players"))
+        )
+        i = interaction()
+        i.response.is_done = lambda: True
+        with self.assertRaises(RuleError) as raised:
+            await panel.children[0].callback(i)
+        await panel.on_error(i, raised.exception, panel.children[0])
+        self.assertEqual(
+            i.edit_original_response.call_args.kwargs,
+            {"content": "No eligible players", "view": None, "embed": None},
+        )
+        i.followup.send.assert_not_awaited()
+
+    async def test_command_acknowledges_before_permission_lookup(self):
+        i = interaction()
+
+        async def check_staff(*args, **kwargs):
+            i.response.defer.assert_awaited_once_with(ephemeral=True)
+
+        bot = SimpleNamespace(engine=MagicMock(), db=MagicMock())
+        with patch("bot.commands.require_staff", side_effect=check_staff):
+            await StaffCommands(bot).check(i)
 
     async def test_setup_sections_fit_discord_component_limits(self):
         panel = SetupPanel(MagicMock(), 10, MagicMock(), None, set(), set())

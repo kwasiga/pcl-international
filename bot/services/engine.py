@@ -746,7 +746,7 @@ class Engine:
                     op["batch_id"],
                     uid,
                 )
-            elif target:
+            if target:
                 cfg = await self.config(con, gid, allow_reset=True)
                 old = op["from_country_id"]
                 if old and old != target:
@@ -889,7 +889,12 @@ class Engine:
                 )
             return club is not None and clubs.get((target, club), 0) >= cfg["club_limit"]
 
-    async def draft(self, guild, actor):
+    async def draft(self, guild, actor, *, progress=None):
+        async def report(text):
+            if progress:
+                await progress(text)
+
+        await report("Waiting for any ongoing server operation to finish…")
         async with self.db.guild(guild.id) as con:
             async with con.transaction():
                 await self.config(con, guild.id, required=("callups_channel_id",))
@@ -898,6 +903,7 @@ class Engine:
                     guild.id,
                 ):
                     raise RuleError("An earlier draft is still running or recovering. Run /sync.")
+                await report("Checking player eligibility, positions, and country capacity…")
                 await self.reconcile_waitlist(con, guild)
                 rows = await con.fetch(
                     "SELECT * FROM waitlist_entries WHERE guild_id=$1 AND status='pending' ORDER BY id",
@@ -912,7 +918,9 @@ class Engine:
                     actor,
                 )
                 # Freeze the entire batch and persist all operations before the first Discord call.
-                for row in rows:
+                log.info("Preparing draft in guild %s: %s players", guild.id, len(rows))
+                for index, row in enumerate(rows, 1):
+                    await report(f"Preparing assignments: **{index}/{len(rows)} players**…")
                     await self.prepare_operation(
                         con,
                         guild,
@@ -932,9 +940,19 @@ class Engine:
                 "SELECT id FROM role_operations WHERE batch_id=$1 ORDER BY id", batch
             )
             succeeded = 0
-            for op in ops:
+            for index, op in enumerate(ops, 1):
+                await report(
+                    f"Assigning country roles: **{index - 1}/{len(ops)} processed**, "
+                    f"**{succeeded} successful**, **{index - 1 - succeeded} awaiting retry**…"
+                )
                 succeeded += await self.execute_operation(con, guild, op["id"])
             await self.finish_batches(con, guild)
+            log.info(
+                "Draft finished in guild %s: %s successful, %s awaiting retry",
+                guild.id,
+                succeeded,
+                len(ops) - succeeded,
+            )
             return succeeded, len(ops) - succeeded
 
     async def finish_batches(self, con, guild):
