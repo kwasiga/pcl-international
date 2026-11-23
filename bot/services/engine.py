@@ -3,6 +3,7 @@
 import json
 import logging
 import secrets
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -229,6 +230,38 @@ class Engine:
             await self.audit(con, gid, "capacity violations", actor, violations=violations)
         return violations
 
+    async def goalkeeper_counts(self, con, guild, goalkeeper_role, countries, exclude_user=None):
+        keepers = {
+            member.id: member
+            for member in guild.members
+            if not member.bot
+            and member.id != exclude_user
+            and any(role.id == goalkeeper_role for role in member.roles)
+        }
+        if not keepers:
+            return {}
+        occupants = defaultdict(set)
+        # Actual country roles also cover GKs who were assigned outside the bot.
+        for uid, member in keepers.items():
+            for cid in {role.id for role in member.roles} & set(countries):
+                occupants[cid].add(uid)
+        rows = await con.fetch(
+            "WITH seats AS ("
+            "SELECT user_id,current_country_role_id AS country FROM players "
+            "WHERE guild_id=$1 AND current_country_role_id IS NOT NULL "
+            "UNION SELECT user_id,proposed_country_role_id FROM waitlist_entries "
+            "WHERE guild_id=$1 AND reservation_active "
+            "UNION SELECT user_id,target_country_id FROM role_operations "
+            "WHERE guild_id=$1 AND status IN ('pending','failed') AND target_country_id IS NOT NULL"
+            ") SELECT user_id,country FROM seats WHERE user_id=ANY($2::bigint[])",
+            guild.id,
+            sorted(keepers),
+        )
+        for row in rows:
+            if row["user_id"] in keepers and row["country"] in countries:
+                occupants[row["country"]].add(row["user_id"])
+        return {cid: len(players) for cid, players in occupants.items()}
+
     async def available(self, con, guild, uid, *, excluded=(), balance=True):
         cfg = await self.config(con, guild.id)
         player = await con.fetchrow(
@@ -245,6 +278,19 @@ class Engine:
             except RuleError:
                 pass
         pop, clubs = await self.counts(con, guild.id, uid)
+        goalkeeper_role = cfg.get("international_gk_role_id")
+        member = guild.get_member(uid)
+        goalkeeper = bool(
+            balance
+            and goalkeeper_role
+            and member
+            and any(role.id == goalkeeper_role for role in member.roles)
+        )
+        keeper_counts = (
+            await self.goalkeeper_counts(con, guild, goalkeeper_role, countries, uid)
+            if goalkeeper
+            else None
+        )
         return choose_country(
             manageable,
             pop,
@@ -254,6 +300,8 @@ class Engine:
             excluded,
             country_cap=cfg.get("country_cap"),
             balance=balance,
+            goalkeeper=goalkeeper,
+            goalkeeper_counts=keeper_counts,
         )
 
     async def idle_player(self, con, gid, uid):
@@ -339,8 +387,8 @@ class Engine:
             await self.audit(con, member.guild.id, "waitlist removal", actor, member.id)
             return result != "UPDATE 0"
 
-    async def reconcile_waitlist(self, con, guild):
-        # Rebuild reservations in original registration order after config/club changes.
+    async def reconcile_waitlist(self, con, guild, *, prioritize_goalkeepers=False):
+        # Preserve registration order within each group when preparing GK places first.
         rows = await con.fetch(
             "SELECT * FROM waitlist_entries WHERE guild_id=$1 "
             "AND status IN ('pending','blocked','unassigned','absent') ORDER BY id",
@@ -348,6 +396,16 @@ class Engine:
         )
         if not rows:
             return
+        if prioritize_goalkeepers:
+            cfg = await self.config(con, guild.id)
+            goalkeeper_role = cfg.get("international_gk_role_id")
+            if goalkeeper_role:
+
+                def is_goalkeeper(row):
+                    member = guild.get_member(row["user_id"])
+                    return bool(member and any(role.id == goalkeeper_role for role in member.roles))
+
+                rows = sorted(rows, key=lambda row: not is_goalkeeper(row))
         await con.execute(
             "UPDATE waitlist_entries SET reservation_active=FALSE WHERE guild_id=$1 "
             "AND status IN ('pending','blocked','unassigned','absent')",
@@ -1004,8 +1062,11 @@ class Engine:
                     guild.id,
                 ):
                     raise RuleError("An earlier draft is still running or recovering. Run /sync.")
+                if not guild.chunked:
+                    await report("Loading server members before checking GK coverage…")
+                    await guild.chunk()
                 await report("Checking player eligibility and country capacity…")
-                await self.reconcile_waitlist(con, guild)
+                await self.reconcile_waitlist(con, guild, prioritize_goalkeepers=True)
                 rows = await con.fetch(
                     "SELECT * FROM waitlist_entries WHERE guild_id=$1 AND status='pending' ORDER BY id",
                     guild.id,

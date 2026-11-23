@@ -60,6 +60,8 @@ def choose_country(
     *,
     country_cap=None,
     balance=True,
+    goalkeeper=False,
+    goalkeeper_counts=None,
 ):
     eligible = [
         c
@@ -74,6 +76,10 @@ def choose_country(
         # Respins draw from every eligible country, rather than always filling
         # the smallest country or the last vacancy left by another respin.
         return (chooser or secrets.choice)(eligible)
+    if goalkeeper:
+        uncovered = [c for c in eligible if (goalkeeper_counts or {}).get(c, 0) == 0]
+        if uncovered:
+            eligible = uncovered
     smallest = min(population.get(c, 0) for c in eligible)
     candidates = [c for c in eligible if population.get(c, 0) == smallest]
     return (chooser or secrets.choice)(candidates)

@@ -615,6 +615,79 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.fetchval("SELECT count(*) FROM cycle_exclusions"), 0)
         self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 3)
 
+    async def test_automatic_gk_draft_accounts_for_country_roles_assigned_outside_bot(self):
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE guild_config SET international_gk_role_id=3 WHERE guild_id=$1",
+                self.guild.id,
+            )
+        existing = self.guild.player(200, (1, 3))
+        incoming = self.guild.player(100, (3,))
+        with patch("bot.services.rules.secrets.choice", side_effect=min):
+            await self.engine.register(incoming)
+            self.assertEqual(
+                await self.fetchval(
+                    "SELECT proposed_country_role_id FROM waitlist_entries WHERE user_id=100"
+                ),
+                2,
+            )
+            self.assertEqual(await self.engine.draft(self.guild, 77), (1, 0))
+        self.assertIn(self.guild.get_role(2), incoming.roles)
+        self.assertIn(self.guild.get_role(1), existing.roles)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM players WHERE user_id=200"), 0)
+
+    async def test_pending_gk_reservations_spread_keepers_before_filling_second_gk_places(self):
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE guild_config SET international_gk_role_id=3 WHERE guild_id=$1",
+                self.guild.id,
+            )
+        for uid in (200, 201, 202):
+            await self.engine.assign(self.guild.player(uid, ()), 2, 77)
+        first, second = self.guild.player(100, (3,)), self.guild.player(101, (3,))
+        with patch("bot.services.rules.secrets.choice", side_effect=min):
+            await self.engine.register(first)
+            await self.engine.register(second)
+            self.assertEqual(
+                await self.fetchval(
+                    "SELECT proposed_country_role_id FROM waitlist_entries WHERE user_id=100"
+                ),
+                1,
+            )
+            self.assertEqual(
+                await self.fetchval(
+                    "SELECT proposed_country_role_id FROM waitlist_entries WHERE user_id=101"
+                ),
+                2,
+            )
+            self.assertEqual(await self.engine.draft(self.guild, 77), (2, 0))
+        self.assertIn(self.guild.get_role(1), first.roles)
+        self.assertIn(self.guild.get_role(2), second.roles)
+
+    async def test_draft_reserves_space_for_later_gk_without_exceeding_country_caps(self):
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE guild_config SET international_gk_role_id=3,country_cap=1 WHERE guild_id=$1",
+                self.guild.id,
+            )
+        for uid in (100, 101):
+            await self.engine.register(self.guild.player(uid, ()))
+        goalkeeper = self.guild.player(102, (3,))
+        self.assertEqual(await self.engine.register(goalkeeper), "unassigned")
+        with patch("bot.services.rules.secrets.choice", side_effect=min):
+            self.assertEqual(await self.engine.draft(self.guild, 77), (2, 0))
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=102"),
+            "completed",
+        )
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=101"),
+            "unassigned",
+        )
+        async with self.db.pool.acquire() as con:
+            population, _ = await self.engine.counts(con, self.guild.id)
+        self.assertEqual(dict(population), {1: 1, 2: 1})
+
     async def test_legacy_positions_no_longer_affect_draft_choices(self):
         self.guild.role_map[4] = Role(4)
         async with self.db.guild(self.guild.id) as con:
