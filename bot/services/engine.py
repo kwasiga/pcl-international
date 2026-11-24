@@ -189,7 +189,9 @@ class Engine:
         )
         return club, conflict
 
-    async def counts(self, con, gid, exclude_user=None):
+    async def counts(self, con, gid, exclude_user=None, *, guild=None):
+        if guild is not None and not guild.chunked:
+            await guild.chunk()
         # Include durable pending operations, even if Discord applied a role before a crash.
         # UNION avoids counting the same user/target reservation twice.
         rows = await con.fetch(
@@ -203,18 +205,33 @@ class Engine:
             UNION
             SELECT user_id,target_country_id FROM role_operations
               WHERE guild_id=$1 AND status IN ('pending','failed') AND target_country_id IS NOT NULL
-          ) SELECT s.country,p.primary_club_role_id AS club FROM seats s
+          ) SELECT s.user_id,s.country,p.primary_club_role_id AS club FROM seats s
           JOIN players p ON p.guild_id=$1 AND p.user_id=s.user_id
           WHERE ($2::bigint IS NULL OR s.user_id <> $2)
         """,
             gid,
             exclude_user,
         )
-        return occupancy(rows)
+        if guild is None:
+            return occupancy(rows)
+        countries = await self.role_ids(con, gid, "country")
+        configured_clubs = await self.role_ids(con, gid, "club", True)
+        # Merge actual country-role holders with saved/reserved places. A player
+        # can occupy a place before staff register them or queued events run.
+        seats = {(row["user_id"], row["country"]): row["club"] for row in rows}
+        saved_clubs = {row["user_id"]: row["club"] for row in rows}
+        for member in guild.members:
+            if member.bot or member.id == exclude_user:
+                continue
+            held = {role.id for role in member.roles}
+            club, _ = primary_club(held, configured_clubs, saved_clubs.get(member.id))
+            for country in held & countries:
+                seats[member.id, country] = club
+        return occupancy({"country": country, "club": club} for (_, country), club in seats.items())
 
-    async def flag_capacity(self, con, gid, actor=None):
+    async def flag_capacity(self, con, gid, actor=None, *, guild=None):
         cfg = await self.config(con, gid, allow_reset=True)
-        population, clubs = await self.counts(con, gid)
+        population, clubs = await self.counts(con, gid, guild=guild)
         violations = [
             {"country": country, "club": club, "count": count, "limit": cfg["club_limit"]}
             for (country, club), count in clubs.items()
@@ -277,7 +294,7 @@ class Engine:
                 manageable.add(cid)
             except RuleError:
                 pass
-        pop, clubs = await self.counts(con, guild.id, uid)
+        pop, clubs = await self.counts(con, guild.id, uid, guild=guild)
         goalkeeper_role = cfg.get("international_gk_role_id")
         member = guild.get_member(uid)
         goalkeeper = bool(
@@ -558,7 +575,7 @@ class Engine:
                         member.id,
                     ):
                         await self.enqueue(con, member, "opt_in")
-                await self.flag_capacity(con, guild.id, actor)
+                await self.flag_capacity(con, guild.id, actor, guild=guild)
                 await self.audit(
                     con,
                     guild.id,
@@ -623,7 +640,7 @@ class Engine:
             validate_role(guild, guild.get_role(target))
             if player["club_conflict"]:
                 raise RuleError("Resolve multiple club roles with /club set first.")
-            population, clubs = await self.counts(con, gid, uid)
+            population, clubs = await self.counts(con, gid, uid, guild=guild)
             if (
                 cfg.get("country_cap") is not None
                 and player["current_country_role_id"] != target
@@ -1029,7 +1046,9 @@ class Engine:
                 raise RuleError("Resolve this player’s primary club first with /club set.")
             if target not in await self.role_ids(con, member.guild.id, "country", True):
                 raise RuleError("Choose an enabled configured country role.")
-            population, clubs = await self.counts(con, member.guild.id, member.id)
+            population, clubs = await self.counts(
+                con, member.guild.id, member.id, guild=member.guild
+            )
             current = await con.fetchval(
                 "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
                 member.guild.id,
@@ -1237,7 +1256,7 @@ class Engine:
                     role.id,
                 )
                 await self.reconcile_waitlist(con, member.guild)
-                await self.flag_capacity(con, member.guild.id, actor)
+                await self.flag_capacity(con, member.guild.id, actor, guild=member.guild)
                 await self.audit(
                     con, member.guild.id, "primary club selected", actor, member.id, club=role.id
                 )
@@ -1437,7 +1456,7 @@ class Engine:
                 if club_changed and known:
                     await self.refresh_player(con, after)
                     await self.reconcile_waitlist(con, after.guild)
-                    await self.flag_capacity(con, after.guild.id)
+                    await self.flag_capacity(con, after.guild.id, guild=after.guild)
                     await self.audit(
                         con,
                         after.guild.id,
@@ -1660,7 +1679,7 @@ class Engine:
                             continue
                         if member.id not in players:
                             await self.enqueue(con, member, "opt_in")
-            pop, clubs = await self.counts(con, guild.id)
+            pop, clubs = await self.counts(con, guild.id, guild=guild)
             if cfg.get("country_cap") is not None:
                 issues.extend(
                     f"<@&{country}>: {count}/{cfg['country_cap']} players including reserved places — over country cap."

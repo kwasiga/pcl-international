@@ -239,7 +239,9 @@ class StaffCommands(commands.Cog):
             )
             view.message = await i.original_response()
         else:
-            raise RuleError("No other country currently has eligible club capacity.")
+            raise RuleError(
+                "No other country has space within the country player cap and club limit."
+            )
 
     @app_commands.command(
         name="remove", description="Remove a country assignment and preserve permanent history"
@@ -329,6 +331,45 @@ class StaffCommands(commands.Cog):
             app_commands.Choice(name=role.name[:100], value=str(role.id))
             for role in sorted(roles, key=lambda r: (r.name.casefold(), r.id))[:25]
         ]
+
+    @app_commands.command(
+        name="country-counts", description="Show current player counts for each configured country"
+    )
+    @app_commands.guild_only()
+    async def country_counts(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True)
+        if i.guild is None:
+            raise RuleError("Use this command inside your Discord server.")
+        async with self.db.pool.acquire() as con:
+            cfg = await self.engine.config(con, i.guild_id, allow_reset=True, allow_paused=True)
+            configured = await self.engine.role_ids(con, i.guild_id, "country", True)
+        members = i.guild.members if i.guild.chunked else await i.guild.chunk()
+        countries = [role for rid in configured if (role := i.guild.get_role(rid)) is not None]
+        players = {role.id: set() for role in countries}
+        for member in members:
+            if member.bot:
+                continue
+            for country in {role.id for role in member.roles} & players.keys():
+                players[country].add(member.id)
+        cap = cfg.get("country_cap")
+        lines = []
+        for role in sorted(countries, key=lambda r: (r.name.casefold(), r.id)):
+            count = len(players[role.id])
+            size = f"{count}/{cap}" if cap is not None else str(count)
+            warning = " — **OVER CAP**" if cap is not None and count > cap else ""
+            if cap is not None and count == cap:
+                warning = " — **FULL**"
+            label = "player" if count == 1 else "players"
+            lines.append(f"<@&{role.id}> — **{size} {label}**{warning}")
+        total = len(set().union(*players.values()))
+        await self.pages(
+            i,
+            "PCL International — Country player counts",
+            lines or ["No national teams configured. Add country roles in /setup."],
+            staff_only=False,
+            footer=f"Countries: {len(countries)} • Current players: {total}",
+            page_breaks=range(8, len(lines), 8),
+        )
 
     @app_commands.command(
         description="List international goalkeepers by country, plus unassigned GKs"
@@ -454,7 +495,7 @@ class StaffCommands(commands.Cog):
             )
             countries = len(await self.engine.role_ids(con, i.guild_id, "country", True))
             clubs = len(await self.engine.role_ids(con, i.guild_id, "club", True))
-            _, occupancy = await self.engine.counts(con, i.guild_id)
+            _, occupancy = await self.engine.counts(con, i.guild_id, guild=i.guild)
             violations = sum(n > cfg["club_limit"] for n in occupancy.values())
         lines = [
             "Bot: **PAUSED** — use /resume to continue."

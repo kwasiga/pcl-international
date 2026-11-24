@@ -826,6 +826,49 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(population.values()), 4)
         self.assertTrue(all(n <= 2 for n in population.values()))
 
+    async def test_untracked_role_holders_block_full_countries_in_respins_and_drafts(self):
+        async with self.db.guild(self.guild.id) as con:
+            await con.execute(
+                "UPDATE guild_config SET country_cap=1 WHERE guild_id=$1", self.guild.id
+            )
+        player = self.guild.player(100, ())
+        await self.engine.assign(player, 1, 77)
+        self.guild.player(101, (2,))  # No player row or saved assignment.
+        _, target, exceptions, _, _ = await self.engine.propose_respin(player)
+        self.assertIsNone(target)
+        self.assertEqual(exceptions, [])
+        self.assertEqual(await self.engine.register(self.guild.player(102, ())), "unassigned")
+        with self.assertRaisesRegex(RuleError, "player cap"):
+            await self.engine.assign(player, 2, 77, action="respin")
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 1)
+
+    async def test_country_filling_after_respin_proposal_does_not_consume_reroll(self):
+        async with self.db.guild(self.guild.id) as con:
+            await con.execute(
+                "UPDATE guild_config SET country_cap=1 WHERE guild_id=$1", self.guild.id
+            )
+        player = self.guild.player(100, ())
+        await self.engine.assign(player, 1, 77)
+        current, target, _, cycle, used = await self.engine.propose_respin(player)
+        self.assertEqual(target, 2)
+        self.guild.player(101, (2,))
+        with self.assertRaisesRegex(RuleError, "player cap"):
+            await self.engine.assign(
+                player,
+                target,
+                77,
+                action="respin",
+                expected=current,
+                expected_cycle=cycle,
+                expected_respins=used,
+            )
+        self.assertEqual(
+            await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=100"), 1
+        )
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 1)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM role_operations"), 1)
+        self.assertEqual({role.id for role in player.roles}, {1})
+
     async def test_lowered_country_cap_preserves_existing_players(self):
         first, second = self.guild.player(100, ()), self.guild.player(101, ())
         await self.engine.assign(first, 1, 77)

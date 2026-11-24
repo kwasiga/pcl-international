@@ -155,6 +155,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     "remove",
                     "respin",
                     "roster",
+                    "country-counts",
                     "goalkeepers",
                     "history",
                     "status",
