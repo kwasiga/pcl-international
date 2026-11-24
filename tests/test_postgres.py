@@ -711,6 +711,46 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             await self.fetchval("SELECT position_groups FROM players WHERE user_id=102"), []
         )
 
+    async def test_removing_one_club_from_setup_preserves_teams_history_and_cycle(self):
+        removed_club_player = self.guild.player(100, (8,))
+        other_player = self.guild.player(101, (9,))
+        await self.engine.assign(removed_club_player, 1, 77)
+        await self.engine.assign(other_player, 2, 77)
+        async with self.db.pool.acquire() as con:
+            cycle = await self.engine.cycle(con, self.guild.id)
+            history_count = await con.fetchval("SELECT count(*) FROM assignment_history")
+            exclusions = await con.fetch("SELECT * FROM cycle_exclusions ORDER BY user_id")
+        values = dict(
+            countries={1, 2},
+            clubs={9},
+            staff_role_id=20,
+            opt_in_role_id=21,
+            callups_channel_id=None,
+            logs_channel_id=None,
+            club_limit=2,
+        )
+        await self.engine.save_config(self.guild, values, 77, expected_revision=1)
+        async with self.db.pool.acquire() as con:
+            self.assertEqual(await self.engine.role_ids(con, self.guild.id, "club", True), {9})
+            self.assertEqual(
+                await self.engine.role_ids(con, self.guild.id, "country", True), {1, 2}
+            )
+            self.assertEqual(await self.engine.cycle(con, self.guild.id), cycle)
+            self.assertEqual(
+                await con.fetchval("SELECT count(*) FROM assignment_history"), history_count
+            )
+            self.assertEqual(
+                await con.fetch("SELECT * FROM cycle_exclusions ORDER BY user_id"), exclusions
+            )
+            players = await con.fetch(
+                "SELECT user_id,current_country_role_id,primary_club_role_id FROM players ORDER BY user_id"
+            )
+        self.assertEqual(
+            [tuple(player.values()) for player in players], [(100, 1, None), (101, 2, 9)]
+        )
+        self.assertEqual({role.id for role in removed_club_player.roles}, {1, 8})
+        self.assertEqual({role.id for role in other_player.roles}, {2, 9})
+
     async def test_international_gk_role_can_be_saved_and_cleared_without_changing_legacy_mappings(
         self,
     ):

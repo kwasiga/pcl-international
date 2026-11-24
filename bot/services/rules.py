@@ -72,14 +72,14 @@ def choose_country(
     ]
     if not eligible:
         return None
-    if not balance:
-        # Respins draw from every eligible country, rather than always filling
-        # the smallest country or the last vacancy left by another respin.
-        return (chooser or secrets.choice)(eligible)
     if goalkeeper:
         uncovered = [c for c in eligible if (goalkeeper_counts or {}).get(c, 0) == 0]
         if uncovered:
             eligible = uncovered
+    if not balance:
+        # Respins stay random within the eligible pool, including the GK
+        # coverage preference, without automatically filling the smallest team.
+        return (chooser or secrets.choice)(eligible)
     smallest = min(population.get(c, 0) for c in eligible)
     candidates = [c for c in eligible if population.get(c, 0) == smallest]
     return (chooser or secrets.choice)(candidates)

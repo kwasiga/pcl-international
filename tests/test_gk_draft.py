@@ -90,7 +90,27 @@ class GoalkeeperDraftRulesTests(unittest.TestCase):
             1,
         )
 
-    def test_gk_respins_remain_random_across_all_eligible_countries(self):
+    def test_gk_respins_prefer_uncovered_countries_without_size_balancing(self):
+        def choose(countries):
+            self.assertEqual(countries, [2, 3])
+            return 3
+
+        self.assertEqual(
+            choose_country(
+                [1, 2, 3],
+                {1: 2, 2: 5, 3: 8},
+                {},
+                None,
+                5,
+                goalkeeper=True,
+                goalkeeper_counts={1: 1},
+                balance=False,
+                chooser=choose,
+            ),
+            3,
+        )
+
+    def test_gk_respins_fall_back_to_random_when_all_countries_have_gks(self):
         def choose(countries):
             self.assertEqual(countries, [1, 2])
             return 1
@@ -103,11 +123,52 @@ class GoalkeeperDraftRulesTests(unittest.TestCase):
                 None,
                 5,
                 goalkeeper=True,
+                goalkeeper_counts={1: 1, 2: 2},
+                balance=False,
+                chooser=choose,
+            ),
+            1,
+        )
+
+    def test_gk_respins_keep_caps_club_limits_and_country_exclusions(self):
+        def choose(countries):
+            self.assertEqual(countries, [1])
+            return 1
+
+        self.assertEqual(
+            choose_country(
+                [1, 2, 3, 4],
+                {1: 8, 2: 17, 3: 5, 4: 6},
+                {(3, 8): 5},
+                8,
+                5,
+                excluded={4},
+                country_cap=17,
+                goalkeeper=True,
                 goalkeeper_counts={1: 1},
                 balance=False,
                 chooser=choose,
             ),
             1,
+        )
+
+    def test_outfield_respins_ignore_gk_coverage_and_remain_random(self):
+        def choose(countries):
+            self.assertEqual(countries, [1, 2])
+            return 2
+
+        self.assertEqual(
+            choose_country(
+                [1, 2],
+                {1: 5, 2: 8},
+                {},
+                None,
+                5,
+                goalkeeper_counts={1: 1},
+                balance=False,
+                chooser=choose,
+            ),
+            2,
         )
 
 
@@ -150,7 +211,7 @@ class GoalkeeperDraftEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await Engine(None, None).goalkeeper_counts(con, guild, 3, {1, 2}, 100), {})
         con.fetch.assert_not_awaited()
 
-    async def test_available_uses_configured_gk_role_only_for_balanced_automatic_choices(self):
+    async def test_available_uses_configured_gk_role_for_drafts_and_respins(self):
         guild = Guild()
         member = guild.player(100, (3, 8))
         con = SimpleNamespace(
@@ -165,8 +226,9 @@ class GoalkeeperDraftEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.goalkeeper_counts.assert_awaited_once_with(con, guild, 3, {1, 2}, member.id)
         engine.goalkeeper_counts.reset_mock()
         with patch("bot.services.rules.secrets.choice", side_effect=min):
-            self.assertEqual(await engine.available(con, guild, member.id, balance=False), 1)
-        engine.goalkeeper_counts.assert_not_awaited()
+            self.assertEqual(await engine.available(con, guild, member.id, balance=False), 2)
+        engine.goalkeeper_counts.assert_awaited_once_with(con, guild, 3, {1, 2}, member.id)
+        engine.goalkeeper_counts.reset_mock()
         member.roles = [guild.get_role(8)]
         self.assertEqual(await engine.available(con, guild, member.id), 1)
         engine.goalkeeper_counts.assert_not_awaited()

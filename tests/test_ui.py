@@ -131,7 +131,8 @@ class UITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("PCL International", panel.embed().title)
 
     async def test_country_selection_supports_incremental_batches_over_25(self):
-        panel = SetupPanel(MagicMock(), 10, MagicMock(), None, set(range(1, 26)), set())
+        guild = SimpleNamespace(get_role=lambda rid: SimpleNamespace(name=f"Country {rid:02}"))
+        panel = SetupPanel(MagicMock(), 10, guild, None, set(range(1, 26)), set())
         panel.values["countries"] |= set(range(26, 51))
         panel.section = "countries"
         panel.build()

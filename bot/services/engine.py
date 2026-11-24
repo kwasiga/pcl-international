@@ -281,10 +281,7 @@ class Engine:
         goalkeeper_role = cfg.get("international_gk_role_id")
         member = guild.get_member(uid)
         goalkeeper = bool(
-            balance
-            and goalkeeper_role
-            and member
-            and any(role.id == goalkeeper_role for role in member.roles)
+            goalkeeper_role and member and any(role.id == goalkeeper_role for role in member.roles)
         )
         keeper_counts = (
             await self.goalkeeper_counts(con, guild, goalkeeper_role, countries, uid)

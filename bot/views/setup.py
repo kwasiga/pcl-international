@@ -105,6 +105,7 @@ class SetupPanel(StaffView):
             cfg.get("international_gk_role_id") if cfg else None
         )
         self.section = "overview"
+        self.role_pages = {"countries": 0, "clubs": 0}
         self.build()
 
     def stop(self):
@@ -127,7 +128,8 @@ class SetupPanel(StaffView):
         e = discord.Embed(title="PCL International — Setup", color=0x2689D9)
         e.description = (
             "Save any section now and return later to finish setup.\n"
-            "Add or remove countries/clubs in batches of up to 25; repeat as needed."
+            "Add roles or choose specific configured countries/clubs to remove, then press **Save**.\n"
+            "Editing these lists preserves player assignments and history."
         )
         e.add_field(
             name="Staff and participation",
@@ -182,7 +184,7 @@ class SetupPanel(StaffView):
             self.role_selector("International opt-in role", "opt_in_role_id", 2)
         elif self.section in ("countries", "clubs"):
             self.role_selector("Add roles (repeat for more than 25)", self.section, 1, "add")
-            self.role_selector("Disable/remove selected roles", self.section, 2, "remove")
+            self.removal_selector(self.section)
         elif self.section == "channels":
             self.channel_selector("National team call-ups channel", "callups_channel_id", 1)
             self.channel_selector("Private staff logs channel", "logs_channel_id", 2)
@@ -236,6 +238,54 @@ class SetupPanel(StaffView):
         cancel.callback = abandon
         self.add_item(cancel)
 
+    def removal_selector(self, key):
+        def role_name(rid):
+            role = self.guild.get_role(rid)
+            return role.name if role else f"Deleted role ({rid})"
+
+        roles = sorted(self.values[key], key=lambda rid: (role_name(rid).casefold(), rid))
+        pages = max(1, (len(roles) + 24) // 25)
+        page = self.role_pages[key] = min(self.role_pages[key], pages - 1)
+        visible = roles[page * 25 : (page + 1) * 25]
+        selector = discord.ui.Select(
+            placeholder=(
+                f"Remove configured {key} ({page + 1}/{pages})"
+                if roles
+                else f"No configured {key} to remove"
+            ),
+            options=[
+                discord.SelectOption(label=role_name(rid)[:100], value=str(rid)) for rid in visible
+            ]
+            or [discord.SelectOption(label="None configured", value="none")],
+            max_values=len(visible) or 1,
+            disabled=not roles,
+            row=2,
+        )
+
+        async def remove(i):
+            ids = {int(rid) for rid in selector.values}
+            if not ids <= set(visible) or not ids <= self.values[key]:
+                raise RuleError("This list changed. Reopen /setup and select a configured role.")
+            self.values[key] -= ids
+            self.build()
+            await i.response.edit_message(embed=self.embed(), view=self)
+
+        selector.callback = remove
+        self.add_item(selector)
+        if pages > 1:
+            for label, step in (("Previous roles", -1), ("Next roles", 1)):
+                button = discord.ui.Button(
+                    label=label, row=3, disabled=not 0 <= page + step < pages
+                )
+
+                async def turn_page(i, step=step):
+                    self.role_pages[key] = max(0, min(pages - 1, page + step))
+                    self.build()
+                    await i.response.edit_message(embed=self.embed(), view=self)
+
+                button.callback = turn_page
+                self.add_item(button)
+
     def role_selector(self, placeholder, key, row, mode=None, *, allow_clear=False):
         selector = discord.ui.RoleSelect(
             placeholder=placeholder,
@@ -250,10 +300,9 @@ class SetupPanel(StaffView):
                 raise RuleError("@everyone cannot be selected.")
             if mode == "add":
                 self.values[key] |= ids
-            elif mode == "remove":
-                self.values[key] -= ids
             else:
                 self.values[key] = next(iter(ids), None)
+            self.build()
             await i.response.edit_message(embed=self.embed(), view=self)
 
         selector.callback = selected
