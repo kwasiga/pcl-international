@@ -45,7 +45,8 @@ class PCLInternational(commands.Bot):
 
     async def on_member_update(self, before, after):
         try:
-            await self.engine.member_update(before, after)
+            if await self.engine.member_update(before, after):
+                await self.engine.flush_outbox(after.guild)
         except BotPausedError:
             await self.engine.defer_event(after)
 
@@ -57,7 +58,8 @@ class PCLInternational(commands.Bot):
 
     async def on_member_join(self, member):
         try:
-            await self.engine.member_joined(member)
+            if await self.engine.member_joined(member):
+                await self.engine.flush_outbox(member.guild)
         except BotPausedError:
             await self.engine.defer_event(member, restore=True)
 
@@ -80,6 +82,7 @@ class PCLInternational(commands.Bot):
                         # Reports missing roles; never blindly restores roles removed while online.
                         await self.engine.sync(guild)
                     self.boot_reconciled.add(guild.id)
+                await self.engine.process_auto_drafts(guild)
                 await self.engine.flush_outbox(guild)
             except BotPausedError:
                 continue

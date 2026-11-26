@@ -150,7 +150,7 @@ class Engine:
                     cfg = await self.config(con, guild.id, allow_reset=True)
                     if any(role.id == cfg["opt_in_role_id"] for role in member.roles):
                         try:
-                            await self.enqueue(con, member, "opt_in", refresh=True)
+                            await self.auto_draft_member(con, member)
                         except BotPausedError:
                             raise
                         except RuleError:
@@ -459,7 +459,17 @@ class Engine:
             await con.execute(
                 "UPDATE waitlist_entries SET reservation_active=FALSE WHERE id=$1", existing["id"]
             )
-        country = None if conflict else await self.available(con, member.guild, uid)
+        country = None
+        if not conflict:
+            reserved = existing["proposed_country_role_id"] if existing else None
+            if reserved:
+                countries = await self.role_ids(con, gid, "country", True)
+                # Revalidate the same seat without drawing a different valid team.
+                country = await self.available(
+                    con, member.guild, uid, excluded=countries - {reserved}, balance=False
+                )
+            if country is None:
+                country = await self.available(con, member.guild, uid)
         status = "blocked" if conflict else ("pending" if country else "unassigned")
         if existing:
             await con.execute(
@@ -482,15 +492,110 @@ class Engine:
                 status,
                 country is not None,
             )
-        await self.audit(
-            con, gid, "waitlist registration", actor, uid, status=status, country=country, club=club
-        )
+        if not existing or (
+            existing["status"] != status or existing["proposed_country_role_id"] != country
+        ):
+            await self.audit(
+                con,
+                gid,
+                "waitlist updated" if existing else "waitlist registration",
+                actor,
+                uid,
+                status=status,
+                country=country,
+                club=club,
+            )
         return status
 
     async def register(self, member, source="manual", actor=None):
         async with self.db.guild(member.guild.id) as con:
             async with con.transaction():
                 return await self.enqueue(con, member, source, actor)
+
+    async def auto_draft_member(self, con, member):
+        """Called with the guild lock held, never inside an outer transaction."""
+        gid, uid = member.guild.id, member.id
+        async with con.transaction():
+            cfg = await self.config(con, gid)
+            status = await self.enqueue(con, member, "opt_in", refresh=True)
+        if status != "pending" or not cfg.get("callups_channel_id"):
+            return status
+        if "draft" in (cfg.get("paused_features") or ()):
+            return "pending"
+        try:
+            # Commit the reservation first, then journal before touching Discord.
+            # A failure preparing the operation leaves the player retryable.
+            async with con.transaction():
+                row = await con.fetchrow(
+                    "SELECT * FROM waitlist_entries WHERE guild_id=$1 AND user_id=$2 "
+                    "AND status='pending' AND reservation_active",
+                    gid,
+                    uid,
+                )
+                if not row:
+                    return "pending"
+                opid = await self.prepare_operation(
+                    con,
+                    member.guild,
+                    uid,
+                    row["proposed_country_role_id"],
+                    "draft",
+                    None,
+                )
+        except BotPausedError as exc:
+            if not exc.feature:
+                raise
+            return "pending"
+        except RuleError as exc:
+            await self.audit(con, gid, "automatic draft delayed", user=uid, error=str(exc))
+            return "pending"
+        try:
+            return "assigned" if await self.execute_operation(con, member.guild, opid) else "failed"
+        except BotPausedError as exc:
+            if not exc.feature:
+                raise
+            return "processing"
+
+    async def process_auto_drafts(self, guild):
+        """Drain existing opt-ins after restart/resume or when capacity changes."""
+        async with self.db.guild(guild.id) as con:
+            if not await con.fetchval("SELECT 1 FROM guild_config WHERE guild_id=$1", guild.id):
+                return
+            cfg = await self.config(con, guild.id, allow_reset=True, allow_paused=True)
+            if (
+                cfg.get("paused")
+                or cfg["resetting"]
+                or "draft" in (cfg.get("paused_features") or ())
+            ):
+                return
+            rows = await con.fetch(
+                "SELECT w.user_id,w.registration_source FROM waitlist_entries w "
+                "WHERE w.guild_id=$1 AND w.status IN ('pending','blocked','unassigned') "
+                "AND NOT EXISTS (SELECT 1 FROM player_bans b WHERE b.guild_id=w.guild_id AND b.user_id=w.user_id) "
+                "ORDER BY w.id",
+                guild.id,
+            )
+            goalkeeper = cfg.get("international_gk_role_id")
+
+            def is_goalkeeper(row):
+                member = guild.get_member(row["user_id"])
+                return bool(member and any(role.id == goalkeeper for role in member.roles))
+
+            for row in sorted(rows, key=lambda row: not is_goalkeeper(row)):
+                member = guild.get_member(row["user_id"])
+                if not member or member.bot:
+                    continue
+                if row["registration_source"] != "opt_in" and not any(
+                    role.id == cfg["opt_in_role_id"] for role in member.roles
+                ):
+                    continue
+                try:
+                    await self.auto_draft_member(con, member)
+                except BotPausedError:
+                    return
+                except RuleError:
+                    # Bans, unfinished operations and conflicts do not stall others.
+                    continue
 
     async def remove_waitlist(self, member, actor):
         async with self.db.guild(member.guild.id) as con:
@@ -526,16 +631,11 @@ class Engine:
                     return bool(member and any(role.id == goalkeeper_role for role in member.roles))
 
                 rows = sorted(rows, key=lambda row: not is_goalkeeper(row))
-        await con.execute(
-            "UPDATE waitlist_entries SET reservation_active=FALSE WHERE guild_id=$1 "
-            "AND status IN ('pending','blocked','unassigned','absent')",
-            guild.id,
-        )
         for row in rows:
             member = guild.get_member(row["user_id"])
             if not member:
                 await con.execute(
-                    "UPDATE waitlist_entries SET status='absent',proposed_country_role_id=NULL,"
+                    "UPDATE waitlist_entries SET status='absent',reservation_active=FALSE,proposed_country_role_id=NULL,"
                     "updated_at=now() WHERE id=$1",
                     row["id"],
                 )
@@ -1280,7 +1380,7 @@ class Engine:
                 rows = await con.fetch(
                     "SELECT o.id,o.batch_id,o.user_id,o.target_country_id FROM role_operations o "
                     "JOIN players p ON p.guild_id=o.guild_id AND p.user_id=o.user_id "
-                    "WHERE o.guild_id=$1 AND o.cycle_id=$2 AND o.batch_id IS NOT NULL "
+                    "WHERE o.guild_id=$1 AND o.cycle_id=$2 AND (o.batch_id IS NOT NULL OR o.action='draft') "
                     "AND o.status='completed' AND p.present "
                     "AND p.current_country_role_id=o.target_country_id "
                     "AND NOT EXISTS (SELECT 1 FROM announcement_outbox a "
@@ -1299,14 +1399,14 @@ class Engine:
                 if country is not None:
                     if country not in ready:
                         raise RuleError(
-                            "That country has no unreleased draft squad ready. Run /draft run "
-                            "first, or /sync if role changes are awaiting recovery."
+                            "That country has no unreleased draft squad ready. Check opt-ins "
+                            "or use /sync if role changes are awaiting recovery."
                         )
                 elif ready:
                     country = secrets.choice(ready)
                 else:
                     raise RuleError(
-                        "No unreleased squads are ready. Run /draft run first, or /sync "
+                        "No unreleased squads are ready. Check opt-ins or use /sync "
                         "if role changes are awaiting recovery."
                     )
                 roster = await con.fetch(
@@ -1589,13 +1689,6 @@ class Engine:
                         "club roles changed",
                         user=after.id,
                     )
-                if cfg["opt_in_role_id"] in new - old:
-                    try:
-                        await self.enqueue(con, after, "opt_in")
-                    except BotPausedError:
-                        raise
-                    except RuleError:
-                        pass  # Already assigned/waitlisted; opt-in is idempotent.
                 managed = await self.role_ids(con, after.guild.id, "country")
                 if (old & managed) != (new & managed):
                     active_op = await con.fetchval(
@@ -1618,6 +1711,14 @@ class Engine:
                             expected=saved,
                             actual=sorted(new & managed),
                         )
+            if cfg["opt_in_role_id"] in new - old:
+                try:
+                    return await self.auto_draft_member(con, after) == "assigned"
+                except BotPausedError:
+                    raise
+                except RuleError:
+                    pass  # Already assigned, banned or owned by an unfinished operation.
+            return False
 
     async def member_left(self, member, *, connection=None):
         async with self.event_connection(member.guild.id, connection) as con:
@@ -1685,6 +1786,8 @@ class Engine:
                     member.id,
                 )
                 if existing or any(r.id == cfg["opt_in_role_id"] for r in member.roles):
+                    if any(r.id == cfg["opt_in_role_id"] for r in member.roles):
+                        return await self.auto_draft_member(con, member) == "assigned"
                     async with con.transaction():
                         await self.enqueue(con, member, "opt_in", refresh=True)
 

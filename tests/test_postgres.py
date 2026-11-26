@@ -150,6 +150,146 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all(isinstance(r, RuleError) for r in results))
 
+    async def opt_in(self, member):
+        before = SimpleNamespace(roles=[role for role in member.roles if role.id != 21])
+        return await self.engine.member_update(before, member)
+
+    async def test_optin_immediately_assigns_reserved_country_once_and_announces(self):
+        member = self.guild.player(100, (8, 21))
+        self.assertTrue(await self.opt_in(member))
+        country = await self.fetchval(
+            "SELECT current_country_role_id FROM players WHERE user_id=100"
+        )
+        self.assertIn(self.guild.get_role(country), member.roles)
+        self.assertNotIn(self.guild.get_role(21), member.roles)
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=100"),
+            "completed",
+        )
+        registration = await self.fetchval(
+            "SELECT details->>'country' FROM audit_logs WHERE action='waitlist registration' AND target_user_id=100"
+        )
+        self.assertEqual(int(registration), country)
+        await self.opt_in(member)
+        await self.engine.process_auto_drafts(self.guild)
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignment_history WHERE user_id=100"), 1
+        )
+        await self.engine.flush_outbox(self.guild)
+        announcements = [
+            call.args[0]
+            for call in self.guild.channel.send.call_args_list
+            if "has been assigned to" in call.args[0]
+        ]
+        self.assertEqual(announcements, [f"**<@100> has been assigned to <@&{country}>!**"])
+        self.assertEqual(await self.engine.release_country(self.guild, 77, country), (country, 1))
+        with self.assertRaisesRegex(RuleError, "unreleased"):
+            await self.engine.release_country(self.guild, 77, country)
+
+    async def test_concurrent_automatic_optins_respect_country_and_club_caps(self):
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE guild_config SET country_cap=2 WHERE guild_id=$1", self.guild.id
+            )
+        members = [self.guild.player(uid, (8, 21)) for uid in range(100, 110)]
+        await asyncio.gather(*(self.opt_in(member) for member in members))
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 4
+        )
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM waitlist_entries WHERE status='unassigned'"),
+            6,
+        )
+        async with self.db.pool.acquire() as con:
+            population, clubs = await self.engine.counts(con, self.guild.id, guild=self.guild)
+        self.assertTrue(all(count <= 2 for count in population.values()))
+        self.assertTrue(all(count <= 2 for count in clubs.values()))
+
+    async def test_draft_pause_queues_optin_then_resumes_the_same_reservation(self):
+        self.guild.player(77, (20,))
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await self.engine.set_paused(self.guild, 77, True, feature="draft")
+        member = self.guild.player(100, (8, 21))
+        self.assertFalse(await self.opt_in(member))
+        country = await self.fetchval(
+            "SELECT proposed_country_role_id FROM waitlist_entries WHERE user_id=100"
+        )
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignments"), 0)
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await self.engine.set_paused(self.guild, 77, False, feature="draft")
+        await self.engine.process_auto_drafts(self.guild)
+        self.assertEqual(
+            await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=100"),
+            country,
+        )
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM audit_logs WHERE action='waitlist registration'"
+            ),
+            1,
+        )
+
+    async def test_failed_automatic_role_change_recovers_without_another_draft(self):
+        member = self.guild.player(100, (8, 21))
+        member.fail = True
+        self.assertFalse(await self.opt_in(member))
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM role_operations WHERE user_id=100"), "failed"
+        )
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 0)
+        member.fail = False
+        await self.engine.recover(self.guild)
+        await self.engine.process_auto_drafts(self.guild)
+        await self.engine.recover(self.guild)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 1)
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM announcement_outbox WHERE dedupe_key LIKE 'operation:%'"
+            ),
+            1,
+        )
+
+    async def test_waiting_optin_is_assigned_when_a_full_country_gets_space(self):
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE guild_config SET country_cap=1 WHERE guild_id=$1", self.guild.id
+            )
+        first, second = self.guild.player(100), self.guild.player(101)
+        await self.engine.assign(first, 1, 77)
+        await self.engine.assign(second, 2, 77)
+        incoming = self.guild.player(102, (8, 21))
+        await self.opt_in(incoming)
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=102"),
+            "unassigned",
+        )
+        await self.engine.assign(first, None, 77, action="remove")
+        await self.engine.process_auto_drafts(self.guild)
+        self.assertEqual(
+            await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=102"), 1
+        )
+
+    async def test_automatic_gk_optin_prefers_country_without_keeper_and_bans_still_block(self):
+        self.guild.role_map[30] = Role(30)
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE guild_config SET international_gk_role_id=30 WHERE guild_id=$1",
+                self.guild.id,
+            )
+        self.guild.player(100, (1, 30))
+        incoming = self.guild.player(101, (30, 21))
+        self.assertTrue(await self.opt_in(incoming))
+        self.assertEqual(
+            await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=101"), 2
+        )
+        banned = self.guild.player(102, (8,))
+        await self.engine.ban_player(banned, 77)
+        banned.roles.append(self.guild.get_role(21))
+        self.assertFalse(await self.opt_in(banned))
+        self.assertIsNone(
+            await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=102")
+        )
+
     async def test_ban_removes_assignment_and_marker_preserving_history_and_respin_usage(self):
         member = self.guild.player(100, (8, 21))
         await self.engine.assign(member, 1, 77)
@@ -411,7 +551,8 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         await restarted.recover(self.guild)
         self.assertIn(self.guild.get_role(1), returning.roles)
         self.assertEqual(
-            await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=101"), "pending"
+            await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=101"),
+            "completed",
         )
         self.assertEqual(await self.fetchval("SELECT count(*) FROM paused_member_events"), 0)
         self.assertEqual(
@@ -845,7 +986,7 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.guild.get_role(1), first.roles)
         self.assertIn(self.guild.get_role(2), second.roles)
 
-    async def test_draft_reserves_space_for_later_gk_without_exceeding_country_caps(self):
+    async def test_draft_preserves_reservations_and_keeps_later_gk_waiting_when_full(self):
         async with self.db.pool.acquire() as con:
             await con.execute(
                 "UPDATE guild_config SET international_gk_role_id=3,country_cap=1 WHERE guild_id=$1",
@@ -859,11 +1000,11 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.engine.draft(self.guild, 77), (2, 0))
         self.assertEqual(
             await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=102"),
-            "completed",
+            "unassigned",
         )
         self.assertEqual(
             await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=101"),
-            "unassigned",
+            "completed",
         )
         async with self.db.pool.acquire() as con:
             population, _ = await self.engine.counts(con, self.guild.id)

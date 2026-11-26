@@ -215,10 +215,10 @@ class PauseTests(unittest.IsolatedAsyncioTestCase):
         engine.is_paused = AsyncMock(return_value=False)
         engine.config = AsyncMock(return_value={"opt_in_role_id": 21})
         engine.refresh_player = AsyncMock()
-        engine.enqueue = AsyncMock()
+        engine.auto_draft_member = AsyncMock()
         engine.reconcile_waitlist = AsyncMock()
         await engine.replay_member_events(con, guild)
-        engine.enqueue.assert_awaited_once_with(con, player, "opt_in", refresh=True)
+        engine.auto_draft_member.assert_awaited_once_with(con, player)
         self.assertEqual(con.execute.call_args.args[1:], (guild.id, 100, 3))
         engine.reconcile_waitlist.assert_awaited_once_with(con, guild)
 
