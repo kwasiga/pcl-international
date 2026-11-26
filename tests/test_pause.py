@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from bot.commands import StaffCommands
 from bot.main import PCLInternational
 from bot.services.engine import Engine
-from bot.services.rules import BotPausedError, RuleError
+from bot.services.rules import PAUSE_FEATURES, BotPausedError, RuleError, operation_feature
 import test_draft_announcements
 from test_postgres import Guild
 
@@ -254,8 +254,152 @@ class PauseTests(unittest.IsolatedAsyncioTestCase):
         )
         await cog.pause.callback(cog, i)
         cog.check.assert_awaited_with(i, True)
-        engine.set_paused.assert_awaited_with(i.guild, 77, True)
+        engine.set_paused.assert_awaited_with(i.guild, 77, True, feature="all")
         await cog.resume.callback(cog, i)
         cog.check.assert_awaited_with(i, True)
-        engine.set_paused.assert_awaited_with(i.guild, 77, False)
+        engine.set_paused.assert_awaited_with(i.guild, 77, False, feature="all")
         self.assertNotIn(50001, bot.boot_reconciled)
+
+
+class FeaturePauseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scoped_config_blocks_only_matching_feature_and_global_pause_takes_precedence(
+        self,
+    ):
+        engine = Engine(None, None)
+        cfg = {"paused": False, "resetting": False, "paused_features": ["respins"]}
+        con = SimpleNamespace(fetchrow=AsyncMock(return_value=cfg))
+        with self.assertRaises(BotPausedError) as raised:
+            await engine.config(con, 50001, feature="respins")
+        self.assertEqual(raised.exception.feature, "respins")
+        self.assertIn("/resume feature:respins", str(raised.exception))
+        self.assertEqual(await engine.config(con, 50001, feature="draft"), cfg)
+        self.assertEqual(await engine.config(con, 50001), cfg)
+        cfg["paused"] = True
+        with self.assertRaises(BotPausedError) as raised:
+            await engine.config(con, 50001, feature="draft")
+        self.assertIsNone(raised.exception.feature)
+        self.assertEqual(await engine.config(con, 50001, allow_paused=True), cfg)
+
+    async def test_service_gates_block_each_feature_before_writing(self):
+        guild = Guild()
+        member = guild.player(100, (1,))
+        cfg = {"paused": False, "resetting": False, "paused_features": []}
+        con = SimpleNamespace(
+            fetchrow=AsyncMock(return_value=cfg), execute=AsyncMock(), transaction=context
+        )
+        engine = Engine(SimpleNamespace(guild=lambda _: context(con)), None)
+        actions = {
+            "respins": [
+                lambda: engine.propose_respin(member),
+                lambda: engine.assign(member, 2, 77, action="respin", respin_override=True),
+                lambda: engine.prepare_operation(con, guild, 100, 2, "respin_exception", 77),
+            ],
+            "draft": [
+                lambda: engine.draft(guild, 77),
+                lambda: engine.release_country(guild, 77),
+                lambda: engine.prepare_operation(con, guild, 100, 2, "draft", 77),
+            ],
+            "assignments": [
+                lambda: engine.assign(member, 2, 77),
+                lambda: engine.assign(member, None, 77, action="remove"),
+                lambda: engine.clear_countries(guild, 77),
+                lambda: engine.needs_override(member, 2),
+            ],
+        }
+        for feature, callbacks in actions.items():
+            cfg["paused_features"] = [feature]
+            for action in callbacks:
+                with self.subTest(feature=feature), self.assertRaises(BotPausedError) as raised:
+                    await action()
+                self.assertEqual(raised.exception.feature, feature)
+        con.execute.assert_not_awaited()
+
+    def test_operation_classification_covers_respins_drafts_and_manual_removals(self):
+        for action in ("respin", "respin_exception"):
+            self.assertEqual(operation_feature(action), "respins")
+        self.assertEqual(operation_feature("draft"), "draft")
+        for action in ("manual", "remove", "clear", "clear_extra"):
+            self.assertEqual(operation_feature(action), "assignments")
+        for action in ("reset", "restore", "role_cleanup"):
+            self.assertIsNone(operation_feature(action))
+
+    @patch("bot.services.engine.apply_roles", new_callable=AsyncMock)
+    async def test_scoped_pause_preserves_pending_operation_without_failure_or_role_changes(
+        self, apply
+    ):
+        engine, con = test_draft_announcements.DraftAnnouncementTests().make_engine()
+        engine.config.return_value["paused_features"] = ["draft"]
+        with self.assertRaises(BotPausedError) as raised:
+            await engine.execute_operation(con, Guild(), 42)
+        self.assertEqual(raised.exception.feature, "draft")
+        con.execute.assert_not_awaited()
+        apply.assert_not_awaited()
+
+    async def test_recovery_skips_paused_feature_and_continues_other_operations(self):
+        con = SimpleNamespace(
+            fetch=AsyncMock(return_value=[{"id": 1}, {"id": 2}, {"id": 3}]),
+            fetchval=AsyncMock(return_value=False),
+        )
+        engine = Engine(None, None)
+        engine.is_paused = AsyncMock(return_value=False)
+        engine.execute_operation = AsyncMock(side_effect=[BotPausedError("respins"), True, True])
+        engine.finish_batches = AsyncMock()
+        engine.finish_reset = AsyncMock()
+        engine.replay_member_events = AsyncMock()
+        await engine.recover_locked(con, Guild())
+        self.assertEqual(engine.execute_operation.await_count, 3)
+        engine.finish_batches.assert_awaited_once()
+        engine.replay_member_events.assert_awaited_once()
+
+    async def test_deferred_member_event_for_paused_operation_does_not_block_other_events(self):
+        guild = Guild()
+        first, second = guild.player(100), guild.player(101)
+        rows = [{"user_id": uid, "needs_restore": True, "version": 1} for uid in (100, 101)]
+        con = SimpleNamespace(fetch=AsyncMock(return_value=rows), execute=AsyncMock())
+        engine = Engine(None, None)
+        engine.is_paused = AsyncMock(return_value=False)
+        engine.config = AsyncMock()
+        engine.member_joined = AsyncMock(side_effect=[BotPausedError("respins"), None])
+        engine.reconcile_waitlist = AsyncMock()
+        await engine.replay_member_events(con, guild)
+        self.assertEqual(
+            [call.args[0] for call in engine.member_joined.call_args_list], [first, second]
+        )
+        con.execute.assert_awaited_once()
+        self.assertEqual(con.execute.call_args.args[1:], (guild.id, second.id, 1))
+
+    async def test_announcement_pause_leaves_queue_intact(self):
+        con = SimpleNamespace(fetch=AsyncMock(), execute=AsyncMock())
+        guild = Guild()
+        engine = Engine(SimpleNamespace(guild=lambda _: context(con)), None)
+        engine.is_paused = AsyncMock(return_value=True)
+        await engine.flush_outbox(guild)
+        engine.is_paused.assert_awaited_once_with(con, guild.id, feature="announcements")
+        con.fetch.assert_not_awaited()
+        con.execute.assert_not_awaited()
+        guild.channel.send.assert_not_awaited()
+
+    async def test_invalid_feature_is_rejected_before_database_access(self):
+        db = MagicMock()
+        with self.assertRaisesRegex(RuleError, "pause options"):
+            await Engine(db, None).set_paused(Guild(), 77, True, feature="unknown")
+        db.pool.acquire.assert_not_called()
+
+    async def test_feature_commands_remain_admin_only_and_resume_only_requested_feature(self):
+        engine = SimpleNamespace(set_paused=AsyncMock(return_value=True))
+        bot = SimpleNamespace(engine=engine, db=None, boot_reconciled={50001})
+        cog = StaffCommands(bot)
+        cog.check = AsyncMock()
+        i = SimpleNamespace(
+            guild=Guild(),
+            guild_id=50001,
+            user=SimpleNamespace(id=77),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        for feature in PAUSE_FEATURES:
+            await cog.pause.callback(cog, i, feature)
+            cog.check.assert_awaited_with(i, True)
+            engine.set_paused.assert_awaited_with(i.guild, 77, True, feature=feature)
+            await cog.resume.callback(cog, i, feature)
+            cog.check.assert_awaited_with(i, True)
+            engine.set_paused.assert_awaited_with(i.guild, 77, False, feature=feature)

@@ -6,7 +6,13 @@ from discord.ext import commands
 
 from bot.services.audit import override_name
 from bot.services.permissions import require_staff
-from bot.services.rules import RESPIN_LIMIT, RuleError, goalkeeper_groups, respin_notice
+from bot.services.rules import (
+    PAUSE_FEATURES,
+    RESPIN_LIMIT,
+    RuleError,
+    goalkeeper_groups,
+    respin_notice,
+)
 from bot.views.common import Confirmation, Pages, StaffView
 from bot.views.setup import SetupPanel
 
@@ -116,7 +122,7 @@ class StaffCommands(commands.Cog):
     async def draft_run(self, i: discord.Interaction):
         await self.check(i)
         async with self.db.pool.acquire() as con:
-            await self.engine.config(con, i.guild_id)
+            await self.engine.config(con, i.guild_id, feature="draft")
             counts = await con.fetch(
                 "SELECT status,count(*) AS n FROM waitlist_entries WHERE guild_id=$1 "
                 "AND status NOT IN ('completed','removed') GROUP BY status",
@@ -501,6 +507,15 @@ class StaffCommands(commands.Cog):
             "Bot: **PAUSED** — use /resume to continue."
             if cfg.get("paused", False)
             else "Bot: **RUNNING**",
+            "Paused features: "
+            + (
+                ", ".join(
+                    PAUSE_FEATURES[feature]
+                    for feature in PAUSE_FEATURES
+                    if feature in (cfg.get("paused_features") or ())
+                )
+                or "None"
+            ),
             f"Cycle: **{cycle}**" + (" — **RESET RECOVERY**" if cfg["resetting"] else ""),
             f"Active players: **{active}**",
             f"Player cap per country: **{cfg.get('country_cap') or 'Unlimited'}**",
@@ -514,9 +529,24 @@ class StaffCommands(commands.Cog):
 
     @app_commands.command(description="Pause actions, role changes, and queued announcements")
     @app_commands.guild_only()
-    async def pause(self, i: discord.Interaction):
+    @app_commands.describe(feature="Pause all actions or only one feature")
+    @app_commands.choices(
+        feature=[
+            app_commands.Choice(name="All features", value="all"),
+            *[app_commands.Choice(name=label, value=key) for key, label in PAUSE_FEATURES.items()],
+        ]
+    )
+    async def pause(self, i: discord.Interaction, feature: str = "all"):
         await self.check(i, True)
-        changed = await self.engine.set_paused(i.guild, i.user.id, True)
+        changed = await self.engine.set_paused(i.guild, i.user.id, True, feature=feature)
+        if feature != "all":
+            label = PAUSE_FEATURES[feature]
+            return await i.followup.send(
+                f"**{label} {'paused' if changed else 'already paused'}.** "
+                "An operation already in progress may finish safely. "
+                f"Use /resume feature:{feature} to continue this feature.",
+                ephemeral=True,
+            )
         await i.followup.send(
             ("**Bot paused.**" if changed else "**Bot is already paused.**")
             + " No new actions will start. A player operation already in progress may finish safely. "
@@ -526,10 +556,24 @@ class StaffCommands(commands.Cog):
 
     @app_commands.command(description="Resume actions and pending work after a pause")
     @app_commands.guild_only()
-    async def resume(self, i: discord.Interaction):
+    @app_commands.describe(feature="Resume everything or only one feature")
+    @app_commands.choices(
+        feature=[
+            app_commands.Choice(name="All features", value="all"),
+            *[app_commands.Choice(name=label, value=key) for key, label in PAUSE_FEATURES.items()],
+        ]
+    )
+    async def resume(self, i: discord.Interaction, feature: str = "all"):
         await self.check(i, True)
-        changed = await self.engine.set_paused(i.guild, i.user.id, False)
+        changed = await self.engine.set_paused(i.guild, i.user.id, False, feature=feature)
         self.bot.boot_reconciled.discard(i.guild_id)
+        if feature != "all":
+            label = PAUSE_FEATURES[feature]
+            return await i.followup.send(
+                f"**{label} {'resumed' if changed else 'already enabled'}.** "
+                "Other active pauses still apply. Pending work will continue automatically.",
+                ephemeral=True,
+            )
         await i.followup.send(
             ("**Bot resumed.**" if changed else "**Bot is already running.**")
             + " Pending work, member updates, and queued announcements will continue automatically.",

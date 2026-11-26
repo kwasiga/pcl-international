@@ -6,12 +6,41 @@ class RuleError(Exception):
     """A safe, user-facing explanation of an invalid operation."""
 
 
+PAUSE_FEATURES = {
+    "respins": "Respins",
+    "draft": "Drafts and squad releases",
+    "assignments": "Manual assignments and removals",
+    "announcements": "Announcements",
+}
+
+
+def operation_feature(action):
+    if action.startswith("respin"):
+        return "respins"
+    if action == "draft":
+        return "draft"
+    if action in {"manual", "remove", "clear", "clear_extra"}:
+        return "assignments"
+    return None
+
+
 class BotPausedError(RuleError):
-    def __init__(self):
+    def __init__(self, feature=None):
+        self.feature = feature
         super().__init__(
-            "PCL International is paused. Pending work is preserved. "
+            f"{PAUSE_FEATURES[feature]} paused. Pending work is preserved. "
+            f"An admin must use /resume feature:{feature} to continue."
+            if feature
+            else "PCL International is paused. Pending work is preserved. "
             "An admin must use /resume before actions can continue."
         )
+
+
+def check_paused(config, feature=None):
+    if config.get("paused", False):
+        raise BotPausedError()
+    if feature and feature in (config.get("paused_features") or ()):
+        raise BotPausedError(feature)
 
 
 RESPIN_LIMIT = 3

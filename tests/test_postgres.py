@@ -172,6 +172,83 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         messages = [c.args[0] for c in self.guild.channel.send.call_args_list]
         self.assertEqual(sum("has been assigned to" in m for m in messages), 1)
 
+    async def test_feature_pauses_persist_and_resuming_one_keeps_other_pauses(self):
+        self.guild.player(77, (20,))
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            self.assertTrue(await self.engine.set_paused(self.guild, 77, True, feature="respins"))
+            self.assertFalse(await self.engine.set_paused(self.guild, 77, True, feature="respins"))
+            self.assertTrue(await self.engine.set_paused(self.guild, 77, True, feature="draft"))
+        restarted = Engine(self.db, self.engine.bot)
+        with self.assertRaises(BotPausedError):
+            await restarted.propose_respin(self.guild.player(100))
+        with self.assertRaises(BotPausedError):
+            await restarted.draft(self.guild, 77)
+        await restarted.assign(self.guild.player(101), 1, 77)
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await restarted.set_paused(self.guild, 77, False, feature="respins")
+            self.assertEqual(
+                await self.fetchval("SELECT paused_features FROM guild_config"), ["draft"]
+            )
+            await restarted.set_paused(self.guild, 77, True)
+            await restarted.set_paused(self.guild, 77, False, feature="draft")
+            self.assertTrue(await self.fetchval("SELECT paused FROM guild_config"))
+            await restarted.set_paused(self.guild, 77, True, feature="respins")
+            await restarted.set_paused(self.guild, 77, False)
+        self.assertFalse(await self.fetchval("SELECT paused FROM guild_config"))
+        self.assertEqual(await self.fetchval("SELECT paused_features FROM guild_config"), [])
+
+    async def test_paused_respin_recovery_waits_while_manual_assignments_continue(self):
+        player = self.guild.player(100)
+        self.guild.player(77, (20,))
+        await self.engine.assign(player, 1, 77)
+        player.fail = True
+        self.assertFalse(await self.engine.assign(player, 2, 77, action="respin"))
+        player.fail = False
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await self.engine.set_paused(self.guild, 77, True, feature="respins")
+        restarted = Engine(self.db, self.engine.bot)
+        await restarted.recover(self.guild)
+        await restarted.assign(self.guild.player(101), 2, 77)
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM role_operations WHERE action='respin'"),
+            "failed",
+        )
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignment_history WHERE action='respin'"), 0
+        )
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await restarted.set_paused(self.guild, 77, False, feature="respins")
+        await restarted.recover(self.guild)
+        await restarted.recover(self.guild)
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM role_operations WHERE action='respin'"),
+            "completed",
+        )
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignment_history WHERE action='respin'"), 1
+        )
+
+    async def test_announcements_can_pause_while_assignments_continue(self):
+        self.guild.player(77, (20,))
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await self.engine.set_paused(self.guild, 77, True, feature="announcements")
+        await self.engine.assign(self.guild.player(100), 1, 77)
+        await self.engine.flush_outbox(self.guild)
+        self.guild.channel.send.assert_not_awaited()
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 1
+        )
+        with patch("bot.services.engine.require_staff", new_callable=AsyncMock):
+            await self.engine.set_paused(self.guild, 77, False, feature="announcements")
+        await self.engine.flush_outbox(self.guild)
+        self.assertEqual(
+            sum(
+                "has been assigned to" in call.args[0]
+                for call in self.guild.channel.send.call_args_list
+            ),
+            1,
+        )
+
     async def test_running_draft_stops_between_players_and_recovers_after_resume(self):
         self.guild.player(77, (20,))
         for uid in (100, 101, 102):

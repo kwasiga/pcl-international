@@ -183,5 +183,13 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                 elif command.name == "history":
                     self.assertEqual(data["options"][0]["name"], "player")
                     self.assertFalse(data["options"][0]["required"])
+                elif command.name in {"pause", "resume"}:
+                    feature = data["options"][0]
+                    self.assertEqual(feature["name"], "feature")
+                    self.assertFalse(feature["required"])
+                    self.assertEqual(
+                        {choice["value"] for choice in feature["choices"]},
+                        {"all", "respins", "draft", "assignments", "announcements"},
+                    )
         finally:
             await bot.close()

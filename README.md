@@ -86,8 +86,8 @@ Press **Save** to keep any partial configuration and return later. Only fields y
 | `/goalkeepers` | Everyone in the server | Lists up to eight countries per page with their International GK role holders, or **No GK**. **Unassigned goalkeepers** appear on separate pages with up to eight players each. Reads actual Discord roles, including members not in the draft database. GKs still holding a disabled country are labelled separately rather than misreported as unassigned. |
 | `/history [player]` | Everyone for their own history; staff for others | Leave player blank to see your permanent dated assignment, transfer, removal, reset, and override history in this server. Each page shows remaining respins out of three for the current draft cycle at the bottom, including when history is empty. Only staff can select another player. |
 | `/status` | Staff | Current cycle, waitlist states, enabled roles, capacity violations, unfinished operations, and queued messages. |
-| `/pause` | Designated admin role or higher | Pauses state-changing commands, automatic role changes, recovery, and announcement delivery. Persists across restarts. |
-| `/resume` | Designated admin role or higher | Resumes pending operations, deferred member events, and queued announcements automatically. |
+| `/pause [feature]` | Designated admin role or higher | Pause everything by default, or choose respins, drafts/squad releases, manual assignments/removals, or announcements. Persists across restarts. |
+| `/resume [feature]` | Designated admin role or higher | Resume everything by default, or only the selected feature. Pending work continues automatically; other active pauses remain in effect. |
 | `/sync` | Staff | Retries unfinished operations and reports current role/database discrepancies. |
 | `/reset` | Designated admin role or higher | Explicit confirmation; clears managed country roles and rebuilds from current opt-ins in a new cycle. |
 
@@ -96,6 +96,17 @@ An authorized staff member has the designated admin role or a higher role in the
 `/pause` blocks drafts, rerolls (including limit overrides), manual assignments/removals, clearing/resetting countries, waitlist changes, club changes, setup saves, squad releases, `/sync`, automatic recovery, and queued messages. `/roster`, `/country-counts`, `/goalkeepers`, `/history`, `/status`, and waitlist viewing remain available with their normal access rules. Existing confirmation buttons recheck the pause when executed. A player role operation or message already in flight may finish safely; the next item waits. Pause does not wait for an entire running draft to finish and remains active after redeployment. No unfinished operation is marked failed merely because of a pause.
 
 Member joins, departures, opt-ins, and other member role updates received while paused are retained in a durable queue. `/resume` lets maintenance continue frozen draft/reset operations, replay member events against current Discord roles, and deliver queued announcements, normally within one minute. If a pause interrupted preparation before the draft batch was committed, its unchanged waitlist remains available for another `/draft run`. Pause/resume are logged, preserve assignments/history/reroll usage, and do not start a new draft cycle.
+
+To pause only one aspect, choose the optional **feature** on `/pause`:
+
+| Feature | Pauses |
+| --- | --- |
+| `respins` | New respin proposals, confirmations (including admin overrides), and unfinished respin recovery. |
+| `draft` | `/draft run`, `/draft country`, and unfinished draft role operations. Players can still join the waitlist. |
+| `assignments` | Manual `/assign`, `/remove`, `/clear`, and recovery of those actions. |
+| `announcements` | Queued call-ups and staff log delivery. Assignments continue and messages remain queued. |
+
+For example, `/pause feature:respins` leaves drafting available; `/resume feature:respins` enables respins again. Several features can be paused at once. `/status` lists them. Feature pauses are checked again when confirmations run and before each pending role operation/message; unrelated recovery continues. A role operation/message already in progress may finish safely. A full bot pause takes precedence over individual settings; `/resume` without a feature clears both the full pause and all feature pauses. Setup, read-only reports, and unrelated commands keep their usual access rules during a feature-only pause.
 
 ## Assignment rules
 
