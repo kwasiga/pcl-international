@@ -37,7 +37,13 @@ class RespinLimitEngineTests(unittest.IsolatedAsyncioTestCase):
         guild = Guild()
         player = guild.player(100, (1,))
         admin = guild.player(77, (20,))
-        con = SimpleNamespace(fetchval=AsyncMock(side_effect=[1, None]))
+        con = SimpleNamespace(
+            fetchval=AsyncMock(
+                side_effect=lambda sql, *args: (
+                    1 if "SELECT current_country_role_id" in sql else None
+                )
+            )
+        )
 
         @asynccontextmanager
         async def context(*args):

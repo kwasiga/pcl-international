@@ -23,6 +23,36 @@ class Role:
 
 
 class RoleSagaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ban_removes_country_optin_and_respun_but_keeps_unrelated_roles(self):
+        guild, member, events = self.fixture([1, 3, 4, 5])
+        await apply_roles(
+            guild,
+            member.id,
+            {1, 2},
+            None,
+            "PCL International: ban",
+            opt_in_role_id=4,
+            respin_role_id=5,
+            clear_respun=True,
+            clear_opt_in=True,
+        )
+        self.assertEqual([role.id for role in member.roles], [3])
+        self.assertEqual(events, [("remove", 1), ("remove", 5), ("remove", 4)])
+
+    async def test_ban_cleanup_with_no_country_still_removes_optin(self):
+        guild, member, events = self.fixture([3, 4])
+        await apply_roles(
+            guild,
+            member.id,
+            {1, 2},
+            None,
+            "PCL International: ban",
+            opt_in_role_id=4,
+            clear_opt_in=True,
+        )
+        self.assertEqual([role.id for role in member.roles], [3])
+        self.assertEqual(events, [("remove", 4)])
+
     def fixture(self, initial):
         roles = {rid: Role(rid) for rid in (1, 2, 3, 4, 5)}
         member = SimpleNamespace(id=10, roles=[roles[r] for r in initial], top_role=Role(3))

@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 from bot.database.connection import Database
 from bot.services.engine import Engine
-from bot.services.rules import BotPausedError, RuleError
+from bot.services.rules import BotPausedError, PlayerBannedError, RuleError
 
 
 class Role:
@@ -149,6 +149,110 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             return_exceptions=True,
         )
         self.assertTrue(all(isinstance(r, RuleError) for r in results))
+
+    async def test_ban_removes_assignment_and_marker_preserving_history_and_respin_usage(self):
+        member = self.guild.player(100, (8, 21))
+        await self.engine.assign(member, 1, 77)
+        await self.engine.assign(member, 2, 77, action="respin")
+        member.roles.append(self.guild.get_role(21))
+        self.assertTrue(await self.engine.ban_player(member, 77, "Inactive"))
+        self.assertEqual({role.id for role in member.roles}, {8})
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM player_bans"), 1)
+        self.assertIsNone(
+            await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=100")
+        )
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 0
+        )
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 3)
+        async with self.db.pool.acquire() as con:
+            self.assertEqual(
+                await self.engine.respins_used(
+                    con, self.guild.id, 100, await self.engine.cycle(con, self.guild.id)
+                ),
+                1,
+            )
+        for action in (
+            lambda: self.engine.register(member),
+            lambda: self.engine.propose_respin(member, override_limit=True),
+            lambda: self.engine.assign(member, 1, 77, override=True),
+        ):
+            with self.assertRaises(PlayerBannedError):
+                await action()
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 3)
+
+    async def test_banning_waitlisted_player_releases_reservation_and_unban_allows_new_registration(
+        self,
+    ):
+        member = self.guild.player(100, (21,))
+        await self.engine.register(member)
+        self.assertTrue(await self.engine.ban_player(member, 77))
+        self.assertEqual(
+            await self.fetchval("SELECT status FROM waitlist_entries WHERE user_id=100"), "removed"
+        )
+        self.assertFalse(
+            await self.fetchval("SELECT reservation_active FROM waitlist_entries WHERE user_id=100")
+        )
+        self.assertEqual(member.roles, [])
+        await self.engine.unban_player(self.guild, 100, 77)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM player_bans"), 0)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM assignments"), 0)
+        self.assertEqual(await self.engine.register(member), "pending")
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM waitlist_entries WHERE status='pending'"), 1
+        )
+
+    async def test_ban_stays_effective_after_role_failure_and_recovers_once(self):
+        member = self.guild.player(100, (8,))
+        await self.engine.assign(member, 1, 77)
+        remove_roles = member.remove_roles
+        member.remove_roles = AsyncMock(side_effect=RuleError("Missing Manage Roles"))
+        self.assertFalse(await self.engine.ban_player(member, 77))
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM player_bans"), 1)
+        with self.assertRaisesRegex(RuleError, "unfinished role operation"):
+            await self.engine.unban_player(self.guild, 100, 77)
+        with self.assertRaises(PlayerBannedError):
+            await self.engine.register(member)
+        member.remove_roles = remove_roles
+        restarted = Engine(self.db, self.engine.bot)
+        await restarted.recover(self.guild)
+        await restarted.recover(self.guild)
+        self.assertEqual({role.id for role in member.roles}, {8})
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignment_history WHERE action='ban'"), 1
+        )
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM player_bans"), 1)
+        self.guild.members.remove(member)
+        await restarted.unban_player(self.guild, 100, 77)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM player_bans"), 0)
+
+    async def test_bans_survive_reset_and_rejoin_without_readding_inactive_players(self):
+        member = self.guild.player(100, (8, 21))
+        await self.engine.ban_player(member, 77)
+        member.roles.append(self.guild.get_role(21))
+        eligible = self.guild.player(101, (21,))
+        self.assertTrue(await self.engine.start_reset(self.guild, 77))
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM player_bans"), 1)
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM waitlist_entries WHERE user_id=100 AND status='pending'"
+            ),
+            0,
+        )
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM waitlist_entries WHERE user_id=101 AND status='pending'"
+            ),
+            1,
+        )
+        await self.engine.member_joined(member)
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM role_operations WHERE user_id=100 AND action='restore'"
+            ),
+            0,
+        )
+        self.assertIn(self.guild.get_role(21), eligible.roles)
 
     async def test_pause_persists_across_restart_and_holds_outbox_until_resume(self):
         member = self.guild.player(100)

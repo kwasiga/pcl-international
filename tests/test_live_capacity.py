@@ -22,7 +22,7 @@ class LiveCapacityTests(unittest.IsolatedAsyncioTestCase):
 
         self.con = SimpleNamespace(
             fetch=AsyncMock(side_effect=fetch),
-            fetchval=AsyncMock(return_value=1),
+            fetchval=AsyncMock(side_effect=lambda sql, *args: None if "player_bans" in sql else 1),
             fetchrow=AsyncMock(
                 return_value={
                     "club_conflict": False,

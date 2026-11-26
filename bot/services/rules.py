@@ -6,6 +6,13 @@ class RuleError(Exception):
     """A safe, user-facing explanation of an invalid operation."""
 
 
+class PlayerBannedError(RuleError):
+    def __init__(self):
+        super().__init__(
+            "This player is banned from international drafts. Use /unban before adding or assigning them."
+        )
+
+
 PAUSE_FEATURES = {
     "respins": "Respins",
     "draft": "Drafts and squad releases",
@@ -19,7 +26,7 @@ def operation_feature(action):
         return "respins"
     if action == "draft":
         return "draft"
-    if action in {"manual", "remove", "clear", "clear_extra"}:
+    if action in {"manual", "remove", "clear", "clear_extra", "ban"}:
         return "assignments"
     return None
 

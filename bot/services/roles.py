@@ -22,6 +22,7 @@ async def apply_roles(
     respin_role_id=None,
     mark_respun=False,
     clear_respun=False,
+    clear_opt_in=False,
     clear_country_ids=None,
 ):
     """Idempotent role saga: add target, remove others, fetch to verify remote state."""
@@ -50,7 +51,11 @@ async def apply_roles(
     if target_id:
         validate_role(guild, target)
     held = {role.id for role in member.roles}
-    opt_in = guild.get_role(opt_in_role_id) if target_id and opt_in_role_id in held else None
+    opt_in = (
+        guild.get_role(opt_in_role_id)
+        if (target_id or clear_opt_in) and opt_in_role_id in held
+        else None
+    )
     respin = guild.get_role(respin_role_id) if respin_role_id else None
     if mark_respun and not respin:
         raise RuleError("The Respun role is missing; retry to recreate it.")
@@ -91,7 +96,7 @@ async def apply_roles(
     actual = {r.id for r in member.roles}
     if (
         actual & set(managed_ids) != ({target_id} if target_id else set())
-        or (target_id and opt_in_role_id in actual)
+        or ((target_id or clear_opt_in) and opt_in_role_id in actual)
         or (mark_respun and respin_role_id not in actual)
         or (clear_respun and respin_role_id in actual)
     ):

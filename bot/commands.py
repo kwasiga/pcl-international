@@ -266,6 +266,109 @@ class StaffCommands(commands.Cog):
 
         await i.followup.send(await run(i), ephemeral=True)
 
+    @app_commands.command(
+        name="ban", description="Exclude an inactive player from international drafts"
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(
+        player="Player to remove from internationals", reason="Why the player is being excluded"
+    )
+    async def ban_player(
+        self, i: discord.Interaction, player: discord.Member, reason: str = "Inactive"
+    ):
+        await self.check(i)
+        removed = await self.engine.ban_player(player, i.user.id, reason)
+        text = f"{player.mention} is **banned from international drafts**. "
+        text += (
+            "Country, opt-in, and Respun roles removed; waitlist entry removed."
+            if removed
+            else "Waitlist entry removed. Role removal is awaiting recovery; fix permissions and use /sync."
+        )
+        await i.followup.send(text, ephemeral=True)
+
+    @app_commands.command(
+        name="bans", description="View players excluded from international drafts"
+    )
+    @app_commands.guild_only()
+    async def bans(self, i: discord.Interaction):
+        await self.check(i)
+        async with self.db.pool.acquire() as con:
+            await self.engine.config(con, i.guild_id, allow_reset=True, allow_paused=True)
+            rows = await con.fetch(
+                "SELECT b.*,EXISTS(SELECT 1 FROM role_operations o WHERE o.guild_id=b.guild_id "
+                "AND o.user_id=b.user_id AND o.action='ban' AND o.status IN ('pending','failed')) AS removal_pending "
+                "FROM player_bans b WHERE b.guild_id=$1 ORDER BY b.created_at DESC,b.user_id",
+                i.guild_id,
+            )
+        lines = []
+        for row in rows:
+            name = discord.utils.escape_markdown(row["player_name"])
+            reason = discord.utils.escape_markdown(row["reason"])
+            pending = "\n**Role removal awaiting /sync.**" if row["removal_pending"] else ""
+            lines.append(
+                f"**<@{row['user_id']}>** ({name})\nReason: {reason}\n"
+                f"By <@{row['actor_id']}> • <t:{int(row['created_at'].timestamp())}:d>{pending}"
+            )
+        await self.pages(
+            i,
+            "PCL International — Banned players",
+            lines or ["No players are banned."],
+            footer=f"Banned players: {len(rows)}",
+            page_breaks=range(8, len(lines), 8),
+        )
+
+    @app_commands.command(
+        name="unban", description="Allow a banned player to opt into internationals again"
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(
+        player="Choose a banned player, or enter their user ID (even after they leave)"
+    )
+    async def unban_player(self, i: discord.Interaction, player: str):
+        await self.check(i)
+        value = player.strip().removeprefix("<@").removeprefix("!").removesuffix(">")
+        if (
+            not value.isascii()
+            or not value.isdecimal()
+            or len(value) > 19
+            or not 0 < int(value) <= 2**63 - 1
+        ):
+            raise RuleError("Choose a banned player from autocomplete, or enter their user ID.")
+        uid = int(value)
+        await self.engine.unban_player(i.guild, uid, i.user.id)
+        await i.followup.send(
+            f"<@{uid}> removed from the ban list. They can opt in again or be added with /waitlist add. "
+            "Their previous country is not automatically restored.",
+            ephemeral=True,
+        )
+
+    @unban_player.autocomplete("player")
+    async def banned_players(self, i: discord.Interaction, current: str):
+        if i.guild is None:
+            return []
+        try:
+            await require_staff(self.db, i.user)
+        except RuleError:
+            return []
+        async with self.db.pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT user_id,player_name FROM player_bans WHERE guild_id=$1 "
+                "AND (player_name ILIKE '%' || $2 || '%' OR user_id::text LIKE $2 || '%') "
+                "ORDER BY player_name,user_id LIMIT 25",
+                i.guild_id,
+                current.strip(),
+            )
+        choices = []
+        for row in rows:
+            member = i.guild.get_member(row["user_id"])
+            name = member.display_name if member else row["player_name"]
+            choices.append(
+                app_commands.Choice(
+                    name=f"{name} ({row['user_id']})"[:100], value=str(row["user_id"])
+                )
+            )
+        return choices
+
     @club.command(name="set", description="Choose a primary club role the player currently holds")
     async def club_set(self, i: discord.Interaction, player: discord.Member, club: discord.Role):
         await self.check(i)

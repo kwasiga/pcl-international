@@ -14,6 +14,7 @@ from bot.services.permissions import require_staff
 from bot.services.roles import apply_roles, validate_role
 from bot.services.rules import (
     RuleError,
+    PlayerBannedError,
     BotPausedError,
     callup_chunks,
     choose_country,
@@ -369,9 +370,70 @@ class Engine:
         ):
             raise RuleError("This player has an unfinished role operation. Run /sync to retry it.")
 
+    async def is_banned(self, con, gid, uid):
+        return bool(
+            await con.fetchval(
+                "SELECT 1 FROM player_bans WHERE guild_id=$1 AND user_id=$2", gid, uid
+            )
+        )
+
+    async def check_not_banned(self, con, gid, uid):
+        if await self.is_banned(con, gid, uid):
+            raise PlayerBannedError()
+
+    async def ban_player(self, member, actor, reason="Inactive"):
+        if member.bot:
+            raise RuleError("Bots cannot participate in the player draft.")
+        reason = reason.strip()
+        if not reason or len(reason) > 500:
+            raise RuleError("Enter a ban reason between 1 and 500 characters.")
+        gid, uid = member.guild.id, member.id
+        async with self.db.guild(gid) as con:
+            async with con.transaction():
+                await self.config(con, gid, feature="assignments")
+                if await self.is_banned(con, gid, uid):
+                    raise RuleError(
+                        "This player is already banned. Use /bans or /sync to check their status."
+                    )
+                opid = await self.prepare_operation(con, member.guild, uid, None, "ban", actor)
+                await con.execute(
+                    "INSERT INTO player_bans(guild_id,user_id,player_name,reason,actor_id) VALUES($1,$2,$3,$4,$5)",
+                    gid,
+                    uid,
+                    str(member),
+                    reason,
+                    actor,
+                )
+                await con.execute(
+                    "UPDATE waitlist_entries SET status='removed',reservation_active=FALSE,"
+                    "proposed_country_role_id=NULL,updated_at=now() WHERE guild_id=$1 AND user_id=$2 "
+                    "AND status NOT IN ('completed','removed')",
+                    gid,
+                    uid,
+                )
+                await self.audit(con, gid, "player banned", actor, uid, reason=reason)
+            # The ban is durable before Discord changes, so role failures cannot
+            # make the player eligible again. The removal remains retryable.
+            return await self.execute_operation(con, member.guild, opid)
+
+    async def unban_player(self, guild, uid, actor):
+        async with self.db.guild(guild.id) as con:
+            async with con.transaction():
+                await self.config(con, guild.id, feature="assignments")
+                await self.idle_player(con, guild.id, uid)
+                removed = await con.fetchval(
+                    "DELETE FROM player_bans WHERE guild_id=$1 AND user_id=$2 RETURNING user_id",
+                    guild.id,
+                    uid,
+                )
+                if not removed:
+                    raise RuleError("This player is not on the ban list.")
+                await self.audit(con, guild.id, "player unbanned", actor, uid)
+
     async def enqueue(self, con, member, source="manual", actor=None, *, refresh=False):
         gid, uid = member.guild.id, member.id
         await self.config(con, gid)
+        await self.check_not_banned(con, gid, uid)
         await self.idle_player(con, gid, uid)
         club, conflict = await self.refresh_player(con, member)
         if await con.fetchval(
@@ -447,7 +509,9 @@ class Engine:
         # Preserve registration order within each group when preparing GK places first.
         rows = await con.fetch(
             "SELECT * FROM waitlist_entries WHERE guild_id=$1 "
-            "AND status IN ('pending','blocked','unassigned','absent') ORDER BY id",
+            "AND status IN ('pending','blocked','unassigned','absent') "
+            "AND NOT EXISTS (SELECT 1 FROM player_bans b WHERE b.guild_id=waitlist_entries.guild_id "
+            "AND b.user_id=waitlist_entries.user_id) ORDER BY id",
             guild.id,
         )
         if not rows:
@@ -616,7 +680,10 @@ class Engine:
                         guild.id,
                         member.id,
                     ):
-                        await self.enqueue(con, member, "opt_in")
+                        try:
+                            await self.enqueue(con, member, "opt_in")
+                        except PlayerBannedError:
+                            continue
                 await self.flag_capacity(con, guild.id, actor, guild=guild)
                 await self.audit(
                     con,
@@ -651,6 +718,8 @@ class Engine:
             required=("callups_channel_id",) if target else (),
             feature=operation_feature(action),
         )
+        if target:
+            await self.check_not_banned(con, gid, uid)
         await self.idle_player(con, gid, uid)
         member = guild.get_member(uid)
         if member:
@@ -775,6 +844,8 @@ class Engine:
             return True
         cfg = await self.config(con, guild.id, allow_reset=True, allow_paused=True)
         check_paused(cfg, operation_feature(op.get("action", "")))
+        if op.get("target_country_id"):
+            await self.check_not_banned(con, guild.id, op["user_id"])
         try:
             already_respun = await con.fetchval(
                 "SELECT has_respun FROM players WHERE guild_id=$1 AND user_id=$2",
@@ -798,7 +869,8 @@ class Engine:
                 opt_in_role_id=cfg["opt_in_role_id"],
                 respin_role_id=respin_role_id,
                 mark_respun=mark_respun,
-                clear_respun=op["action"] in {"remove", "reset", "clear"},
+                clear_respun=op["action"] in {"remove", "reset", "clear", "ban"},
+                clear_opt_in=op["action"] == "ban",
                 clear_country_ids=op["clear_country_ids"],
             )
         except (discord.HTTPException, RuleError) as exc:
@@ -875,7 +947,7 @@ class Engine:
                     uid,
                     target,
                 )
-            elif op["action"] in {"remove", "clear"}:
+            elif op["action"] in {"remove", "clear", "ban"}:
                 await con.execute(
                     "DELETE FROM cycle_exclusions WHERE guild_id=$1 AND user_id=$2 AND cycle_id=$3",
                     gid,
@@ -1051,6 +1123,7 @@ class Engine:
     async def propose_respin(self, member, *, override_limit=False):
         async with self.db.guild(member.guild.id) as con:
             await self.config(con, member.guild.id, feature="respins")
+            await self.check_not_banned(con, member.guild.id, member.id)
             await self.idle_player(con, member.guild.id, member.id)
             await self.refresh_player(con, member)
             cycle = await self.cycle(con, member.guild.id)
@@ -1083,6 +1156,7 @@ class Engine:
     async def needs_override(self, member, target):
         async with self.db.guild(member.guild.id) as con:
             cfg = await self.config(con, member.guild.id, feature="assignments")
+            await self.check_not_banned(con, member.guild.id, member.id)
             club, conflict = await self.refresh_player(con, member)
             if conflict:
                 raise RuleError("Resolve this player’s primary club first with /club set.")
@@ -1449,7 +1523,10 @@ class Engine:
             await con.execute("UPDATE guild_config SET resetting=FALSE WHERE guild_id=$1", guild.id)
             for member in guild.members:
                 if not member.bot and any(r.id == cfg["opt_in_role_id"] for r in member.roles):
-                    await self.enqueue(con, member, "opt_in")
+                    try:
+                        await self.enqueue(con, member, "opt_in")
+                    except PlayerBannedError:
+                        continue
             await self.audit(con, guild.id, "reset completed")
 
     async def recover_locked(self, con, guild):
@@ -1581,6 +1658,8 @@ class Engine:
             )
             if op:
                 await self.execute_operation(con, member.guild, op)
+                return
+            if await self.is_banned(con, member.guild.id, member.id):
                 return
             saved = await con.fetchval(
                 "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
@@ -1727,7 +1806,10 @@ class Engine:
                         ):
                             continue
                         if member.id not in players:
-                            await self.enqueue(con, member, "opt_in")
+                            try:
+                                await self.enqueue(con, member, "opt_in")
+                            except PlayerBannedError:
+                                continue
             pop, clubs = await self.counts(con, guild.id, guild=guild)
             if cfg.get("country_cap") is not None:
                 issues.extend(

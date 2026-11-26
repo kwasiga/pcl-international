@@ -153,6 +153,9 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     "draft",
                     "assign",
                     "remove",
+                    "ban",
+                    "bans",
+                    "unban",
                     "respin",
                     "roster",
                     "country-counts",
@@ -174,6 +177,9 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     reveal = next(o for o in data["options"] if o["name"] == "country")
                     self.assertFalse(reveal["options"][0]["required"])
                 elif command.name == "roster":
+                    self.assertEqual(data["options"][0]["type"], 3)
+                    self.assertTrue(data["options"][0]["autocomplete"])
+                elif command.name == "unban":
                     self.assertEqual(data["options"][0]["type"], 3)
                     self.assertTrue(data["options"][0]["autocomplete"])
                 elif command.name == "respin":
