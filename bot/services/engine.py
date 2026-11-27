@@ -1226,6 +1226,13 @@ class Engine:
             )
         return True
 
+    async def remove_country(self, guild, uid, actor):
+        """Remove a saved assignment by ID, including members who already left."""
+        async with self.db.guild(guild.id) as con:
+            async with con.transaction():
+                opid = await self.prepare_operation(con, guild, uid, None, "remove", actor)
+            return await self.execute_operation(con, guild, opid)
+
     async def assign(
         self,
         member,

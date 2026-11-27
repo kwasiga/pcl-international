@@ -253,18 +253,40 @@ class StaffCommands(commands.Cog):
         name="remove", description="Remove a country assignment and preserve permanent history"
     )
     @app_commands.guild_only()
-    async def remove_player(self, i: discord.Interaction, player: discord.Member):
+    @app_commands.describe(
+        player="Select a player who is still in the server",
+        user_id="For someone who left: paste their Discord user ID instead of selecting a player",
+    )
+    async def remove_player(
+        self,
+        i: discord.Interaction,
+        player: discord.Member | None = None,
+        user_id: str | None = None,
+    ):
         await self.check(i)
-
-        async def run(click):
-            ok = await self.engine.assign(player, None, click.user.id, action="remove")
-            return (
-                "Country removed. History preserved; player was not requeued."
-                if ok
-                else "Removal awaiting recovery. Use /sync."
+        if (player is None) == (user_id is None):
+            raise RuleError(
+                "Select a player or provide user_id for someone who left. Use just one option."
             )
-
-        await i.followup.send(await run(i), ephemeral=True)
+        if player is not None:
+            uid = player.id
+        else:
+            value = user_id.strip().removeprefix("<@").removeprefix("!").removesuffix(">")
+            if (
+                not value.isascii()
+                or not value.isdecimal()
+                or len(value) > 19
+                or not 0 < int(value) <= 2**63 - 1
+            ):
+                raise RuleError("Enter a valid Discord user ID in user_id.")
+            uid = int(value)
+        ok = await self.engine.remove_country(i.guild, uid, i.user.id)
+        await i.followup.send(
+            f"<@{uid}>'s country assignment removed. History preserved; player was not requeued."
+            if ok
+            else "Removal awaiting recovery. Use /sync.",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="ban", description="Exclude an inactive player from international drafts"

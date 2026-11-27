@@ -183,6 +183,11 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                 elif command.name == "unban":
                     self.assertEqual(data["options"][0]["type"], 3)
                     self.assertTrue(data["options"][0]["autocomplete"])
+                elif command.name == "remove":
+                    options = {option["name"]: option for option in data["options"]}
+                    self.assertEqual(options["player"]["type"], 6)
+                    self.assertEqual(options["user_id"]["type"], 3)
+                    self.assertTrue(all(not option["required"] for option in options.values()))
                 elif command.name == "respin":
                     override = next(o for o in data["options"] if o["name"] == "override_limit")
                     self.assertEqual(override["type"], 5)

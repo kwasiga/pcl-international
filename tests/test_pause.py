@@ -49,6 +49,7 @@ class PauseTests(unittest.IsolatedAsyncioTestCase):
             lambda: engine.ban_player(player, 77),
             lambda: engine.unban_player(guild, player.id, 77),
             lambda: engine.set_club_bypass(player, 77),
+            lambda: engine.remove_country(guild, player.id, 77),
         ]
         for action in actions:
             with self.subTest(action=action), self.assertRaises(BotPausedError):
@@ -310,6 +311,7 @@ class FeaturePauseTests(unittest.IsolatedAsyncioTestCase):
                 lambda: engine.ban_player(member, 77),
                 lambda: engine.unban_player(guild, member.id, 77),
                 lambda: engine.set_club_bypass(member, 77),
+                lambda: engine.remove_country(guild, member.id, 77),
             ],
         }
         for feature, callbacks in actions.items():

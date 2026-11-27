@@ -79,7 +79,7 @@ Press **Save** to keep any partial configuration and return later. Only fields y
 | `/respin player [override_limit]` | Staff | Randomly proposes an eligible country, with three rerolls per player per cycle. Warns before the third; `override_limit:True` explicitly approves an extra reroll with a logged admin confirmation. |
 | `/assign player country` | Staff | Manual assignment/transfer. Exceeding the club limit requires explicit logged confirmation. |
 | `/clear [country]` | Staff | Confirm removal of everyone from one country; omit country to clear all configured countries. Preserves history and the current cycle. |
-| `/remove player` | Staff | Clears country and current-cycle exclusions, preserves history, and does not requeue. |
+| `/remove [player] [user_id]` | Staff | Select a current member, or paste the Discord user ID of someone who left. Use exactly one option. Clears country and current-cycle exclusions, preserves history/reroll usage, and does not requeue. Removed assignments are not restored on rejoin. |
 | `/ban player [reason]` | Staff | Bans the player from international drafts, removes their country/opt-in/Respun roles and waitlist reservation, and preserves history. Default reason: Inactive. This is a draft ban, not a Discord server ban. |
 | `/bans` | Staff | Private list of banned players with reason, staff member, date, and any pending role cleanup. Up to eight players per page. Available while paused. |
 | `/unban player` | Staff | Removes the draft ban. Choose from banned-player autocomplete or enter a user ID, including departed players. Does not restore the previous country or automatically requeue them. |

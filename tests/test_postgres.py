@@ -821,6 +821,50 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.guild.get_role(1), member.roles)
         self.assertEqual(await self.fetchval("SELECT count(*) FROM assignment_history"), 1)
 
+    async def test_remove_departed_player_by_id_preserves_history_and_prevents_restoration(self):
+        import discord
+
+        member = self.guild.player(100, (8,))
+        await self.engine.assign(member, 1, 77)
+        await self.engine.assign(member, 2, 77, action="respin")
+        self.guild.members.remove(member)
+        await self.engine.member_left(member)
+        original_fetch = self.guild.fetch_member
+
+        async def fetch(uid):
+            if not self.guild.get_member(uid):
+                raise discord.NotFound(
+                    SimpleNamespace(status=404, reason="Not Found"),
+                    {"message": "Unknown Member", "code": 10007},
+                )
+            return await original_fetch(uid)
+
+        self.guild.fetch_member = fetch
+        self.assertTrue(await self.engine.remove_country(self.guild, member.id, 77))
+        self.assertIsNone(
+            await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=100")
+        )
+        self.assertFalse(await self.fetchval("SELECT present FROM players WHERE user_id=100"))
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 0
+        )
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignment_history WHERE user_id=100"), 3
+        )
+        self.assertEqual(
+            await self.fetchval(
+                "SELECT count(*) FROM assignment_history WHERE action='respin' AND user_id=100"
+            ),
+            1,
+        )
+        self.guild.members.append(member)
+        member.roles = [self.guild.get_role(8)]
+        await self.engine.member_joined(member)
+        self.assertNotIn(self.guild.get_role(2), member.roles)
+        self.assertIsNone(
+            await self.fetchval("SELECT current_country_role_id FROM players WHERE user_id=100")
+        )
+
     async def test_reset_preserves_history_rebuilds_optins_only(self):
         opted = self.guild.player(100, (8, 21))
         manual = self.guild.player(101, (8,))
