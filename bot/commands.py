@@ -378,6 +378,31 @@ class StaffCommands(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.command(
+        name="bypass", description="Exempt a current player from their country's club limit"
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(
+        player="Player already assigned to a country",
+        enabled="True to grant the bypass; False to remove it",
+        reason="Why this current country/club combination needs an exception",
+    )
+    async def bypass(
+        self,
+        i: discord.Interaction,
+        player: discord.Member,
+        enabled: bool = True,
+        reason: str = "Club changed after draft",
+    ):
+        await self.check(i)
+        country, club = await self.engine.set_club_bypass(player, i.user.id, enabled, reason)
+        await i.followup.send(
+            f"**Club-limit bypass {'enabled' if enabled else 'removed'}** for {player.mention} "
+            f"in <@&{country}> / <@&{club}>. "
+            "The player still counts toward the country's total player cap.",
+            ephemeral=True,
+        )
+
     @app_commands.command(description="View a country’s active roster grouped by primary club")
     @app_commands.guild_only()
     @app_commands.describe(country="Choose a national team configured in /setup")
@@ -398,14 +423,26 @@ class StaffCommands(commands.Cog):
                 raise RuleError("Choose a country from the configured national team list.")
             cfg = await self.engine.config(con, i.guild_id, allow_reset=True, allow_paused=True)
             rows = await con.fetch(
-                "SELECT user_id,primary_club_role_id,club_conflict,present FROM players "
-                "WHERE guild_id=$1 AND current_country_role_id=$2 ORDER BY primary_club_role_id NULLS LAST,user_id",
+                "SELECT p.user_id,p.primary_club_role_id,p.club_conflict,p.present,"
+                "EXISTS(SELECT 1 FROM club_limit_bypasses b JOIN draft_cycles c ON c.id=b.cycle_id AND c.status='active' "
+                "WHERE b.guild_id=p.guild_id AND b.user_id=p.user_id AND b.country_role_id=p.current_country_role_id "
+                "AND b.club_role_id=p.primary_club_role_id) AS club_bypass FROM players p "
+                "WHERE p.guild_id=$1 AND p.current_country_role_id=$2 ORDER BY p.primary_club_role_id NULLS LAST,p.user_id",
                 i.guild_id,
                 country_id,
             )
         groups = defaultdict(list)
+        bypassed = set()
         for r in rows:
             groups[r["primary_club_role_id"]].append(r)
+            member = i.guild.get_member(r["user_id"])
+            held = {role.id for role in member.roles} if member else set()
+            if (
+                r.get("club_bypass", False)
+                and country_id in held
+                and r["primary_club_role_id"] in held
+            ):
+                bypassed.add(r["user_id"])
         lines = [f"**Total active players: {len(rows)}**"]
         if cfg.get("country_cap") is not None:
             lines.append(
@@ -414,12 +451,23 @@ class StaffCommands(commands.Cog):
             )
         for club, players in groups.items():
             label = f"<@&{club}>" if club else "Unaffiliated / unresolved"
-            warning = " — **OVER CLUB LIMIT**" if club and len(players) > cfg["club_limit"] else ""
-            lines.append(f"\n**{label} ({len(players)})**{warning}")
+            exempt = sum(p["user_id"] in bypassed for p in players)
+            warning = (
+                " — **OVER CLUB LIMIT**"
+                if club and len(players) - exempt > cfg["club_limit"]
+                else ""
+            )
+            size = (
+                f"{len(players)} players • {exempt} bypassed • {len(players) - exempt} counted"
+                if exempt
+                else str(len(players))
+            )
+            lines.append(f"\n**{label} ({size})**{warning}")
             lines.extend(
                 f"<@{p['user_id']}>"
                 + (" — absent" if not p["present"] else "")
                 + (" — club conflict" if p["club_conflict"] else "")
+                + (" — club-limit bypass" if p["user_id"] in bypassed else "")
                 for p in players
             )
         await self.pages(i, f"{role.name} — Active roster", lines, staff_only=False)

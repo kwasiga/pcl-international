@@ -125,7 +125,7 @@ def occupancy(rows):
     population, clubs = defaultdict(int), defaultdict(int)
     for row in rows:
         population[row["country"]] += 1
-        if row["club"] is not None:
+        if row["club"] is not None and not row.get("club_bypass", False):
             clubs[row["country"], row["club"]] += 1
     return population, clubs
 

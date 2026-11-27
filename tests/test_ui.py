@@ -150,6 +150,7 @@ class UITests(unittest.IsolatedAsyncioTestCase):
                     "setup",
                     "waitlist",
                     "club",
+                    "bypass",
                     "draft",
                     "assign",
                     "remove",

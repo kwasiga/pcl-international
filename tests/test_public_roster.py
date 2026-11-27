@@ -64,6 +64,26 @@ class PublicRosterTests(unittest.IsolatedAsyncioTestCase):
         self.con.fetch.assert_not_awaited()
         self.cog.pages.assert_not_awaited()
 
+    async def test_roster_marks_bypassed_player_without_warning_for_approved_extra(self):
+        self.engine.config.return_value["club_limit"] = 3
+        self.con.fetch.return_value = []
+        for uid in range(100, 104):
+            self.guild.player(uid, (1, 8))
+            self.con.fetch.return_value.append(
+                {
+                    "user_id": uid,
+                    "primary_club_role_id": 8,
+                    "club_conflict": False,
+                    "present": True,
+                    "club_bypass": uid == 103,
+                }
+            )
+        await self.cog.roster.callback(self.cog, self.i, "1")
+        text = "\n".join(self.cog.pages.call_args.args[2])
+        self.assertIn("4 players • 1 bypassed • 3 counted", text)
+        self.assertIn("<@103> — club-limit bypass", text)
+        self.assertNotIn("OVER CLUB LIMIT", text)
+
     async def test_stale_autocomplete_selection_is_revalidated(self):
         choices = await self.cog.roster_countries(self.i, "ghana")
         self.assertEqual([c.value for c in choices], ["1"])

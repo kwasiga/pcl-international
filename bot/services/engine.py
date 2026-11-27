@@ -230,7 +230,94 @@ class Engine:
             club,
             conflict,
         )
+        await self.expire_club_bypasses(con, gid, uid)
         return club, conflict
+
+    async def expire_club_bypasses(self, con, gid, uid):
+        await con.execute(
+            "DELETE FROM club_limit_bypasses b USING players p WHERE b.guild_id=$1 AND b.user_id=$2 "
+            "AND p.guild_id=b.guild_id AND p.user_id=b.user_id AND ("
+            "b.country_role_id IS DISTINCT FROM p.current_country_role_id OR "
+            "b.club_role_id IS DISTINCT FROM p.primary_club_role_id OR "
+            "NOT EXISTS(SELECT 1 FROM draft_cycles c WHERE c.id=b.cycle_id AND c.status='active'))",
+            gid,
+            uid,
+        )
+
+    async def has_club_bypass(self, con, gid, uid, country, club):
+        return bool(
+            await con.fetchval(
+                "SELECT 1 FROM club_limit_bypasses b JOIN players p ON p.guild_id=b.guild_id AND p.user_id=b.user_id "
+                "JOIN draft_cycles c ON c.id=b.cycle_id AND c.status='active' "
+                "WHERE b.guild_id=$1 AND b.user_id=$2 AND b.country_role_id=$3 AND b.club_role_id=$4 "
+                "AND p.current_country_role_id=b.country_role_id AND p.primary_club_role_id=b.club_role_id",
+                gid,
+                uid,
+                country,
+                club,
+            )
+        )
+
+    async def set_club_bypass(self, member, actor, enabled=True, reason="Club changed after draft"):
+        gid, uid = member.guild.id, member.id
+        async with self.db.guild(gid) as con:
+            async with con.transaction():
+                await self.config(con, gid, feature="assignments")
+                await self.idle_player(con, gid, uid)
+                if not enabled:
+                    row = await con.fetchrow(
+                        "DELETE FROM club_limit_bypasses WHERE guild_id=$1 AND user_id=$2 "
+                        "RETURNING country_role_id,club_role_id",
+                        gid,
+                        uid,
+                    )
+                    if not row:
+                        raise RuleError("This player has no club-limit bypass.")
+                    country, club = row["country_role_id"], row["club_role_id"]
+                else:
+                    reason = reason.strip()
+                    if not reason or len(reason) > 500:
+                        raise RuleError("Enter a bypass reason between 1 and 500 characters.")
+                    await self.check_not_banned(con, gid, uid)
+                    member = await member.guild.fetch_member(uid)
+                    club, conflict = await self.refresh_player(con, member)
+                    if conflict:
+                        raise RuleError("Select the player's primary club with /club set first.")
+                    country = await con.fetchval(
+                        "SELECT current_country_role_id FROM players WHERE guild_id=$1 AND user_id=$2",
+                        gid,
+                        uid,
+                    )
+                    held = {role.id for role in member.roles}
+                    if not country or country not in held:
+                        raise RuleError(
+                            "The player must have a saved country and still hold its role. Use /assign to reconcile first."
+                        )
+                    if not club or club not in held:
+                        raise RuleError("The player must hold an enabled league club role.")
+                    await con.execute(
+                        "INSERT INTO club_limit_bypasses(guild_id,user_id,cycle_id,country_role_id,club_role_id,actor_id,reason) "
+                        "VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(guild_id,user_id) DO UPDATE SET "
+                        "cycle_id=$3,country_role_id=$4,club_role_id=$5,actor_id=$6,reason=$7,created_at=now()",
+                        gid,
+                        uid,
+                        await self.cycle(con, gid),
+                        country,
+                        club,
+                        actor,
+                        reason,
+                    )
+                await self.audit(
+                    con,
+                    gid,
+                    "club-limit bypass enabled" if enabled else "club-limit bypass removed",
+                    actor,
+                    uid,
+                    country=country,
+                    club=club,
+                    **({"reason": reason} if enabled else {}),
+                )
+                return country, club
 
     async def counts(self, con, gid, exclude_user=None, *, guild=None):
         if guild is not None and not guild.chunked:
@@ -248,7 +335,11 @@ class Engine:
             UNION
             SELECT user_id,target_country_id FROM role_operations
               WHERE guild_id=$1 AND status IN ('pending','failed') AND target_country_id IS NOT NULL
-          ) SELECT s.user_id,s.country,p.primary_club_role_id AS club FROM seats s
+          ) SELECT s.user_id,s.country,p.primary_club_role_id AS club,
+            EXISTS(SELECT 1 FROM club_limit_bypasses b JOIN draft_cycles c ON c.id=b.cycle_id AND c.status='active'
+              WHERE b.guild_id=p.guild_id AND b.user_id=p.user_id AND b.country_role_id=s.country
+              AND b.country_role_id=p.current_country_role_id AND b.club_role_id=p.primary_club_role_id) AS club_bypass
+          FROM seats s
           JOIN players p ON p.guild_id=$1 AND p.user_id=s.user_id
           WHERE ($2::bigint IS NULL OR s.user_id <> $2)
         """,
@@ -262,7 +353,13 @@ class Engine:
         # Merge actual country-role holders with saved/reserved places. A player
         # can occupy a place before staff register them or queued events run.
         seats = {(row["user_id"], row["country"]): row["club"] for row in rows}
+        bypasses = {
+            (row["user_id"], row["country"], row["club"])
+            for row in rows
+            if row.get("club_bypass", False)
+        }
         saved_clubs = {row["user_id"]: row["club"] for row in rows}
+        members = {member.id: member for member in guild.members}
         for member in guild.members:
             if member.bot or member.id == exclude_user:
                 continue
@@ -270,7 +367,13 @@ class Engine:
             club, _ = primary_club(held, configured_clubs, saved_clubs.get(member.id))
             for country in held & countries:
                 seats[member.id, country] = club
-        return occupancy({"country": country, "club": club} for (_, country), club in seats.items())
+        counted = []
+        for (uid, country), club in seats.items():
+            member = members.get(uid)
+            held = {role.id for role in member.roles} if member else set()
+            exempt = (uid, country, club) in bypasses and country in held and club in held
+            counted.append({"country": country, "club": club, "club_bypass": exempt})
+        return occupancy(counted)
 
     async def flag_capacity(self, con, gid, actor=None, *, guild=None):
         cfg = await self.config(con, gid, allow_reset=True)
@@ -862,7 +965,15 @@ class Engine:
                     "That country is at its player cap, including reserved places. Choose another country or raise the cap in /setup."
                 )
             club = player["primary_club_role_id"]
-            if club and clubs.get((target, club), 0) >= cfg["club_limit"] and not override:
+            exempt = player["current_country_role_id"] == target and await self.has_club_bypass(
+                con, gid, uid, target, club
+            )
+            if (
+                club
+                and clubs.get((target, club), 0) >= cfg["club_limit"]
+                and not override
+                and not exempt
+            ):
                 raise RuleError(
                     "Club limit reached. Reopen /assign to explicitly confirm an override."
                 )
@@ -1061,6 +1172,7 @@ class Engine:
                 target,
                 mark_respun,
             )
+            await self.expire_club_bypasses(con, gid, uid)
             await con.execute(
                 "INSERT INTO assignment_history(guild_id,cycle_id,user_id,from_country_id,to_country_id,"
                 "action,actor_id,override_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
@@ -1278,7 +1390,14 @@ class Engine:
                 raise RuleError(
                     "That country is at its player cap, including reserved places. Choose another country or raise the cap in /setup."
                 )
-            return club is not None and clubs.get((target, club), 0) >= cfg["club_limit"]
+            exempt = current == target and await self.has_club_bypass(
+                con, member.guild.id, member.id, target, club
+            )
+            return (
+                club is not None
+                and clubs.get((target, club), 0) >= cfg["club_limit"]
+                and not exempt
+            )
 
     async def draft(self, guild, actor, *, progress=None):
         async def report(text):
@@ -1473,6 +1592,7 @@ class Engine:
                     member.id,
                     role.id,
                 )
+                await self.expire_club_bypasses(con, member.guild.id, member.id)
                 await self.reconcile_waitlist(con, member.guild)
                 await self.flag_capacity(con, member.guild.id, actor, guild=member.guild)
                 await self.audit(
@@ -1620,6 +1740,7 @@ class Engine:
             )
             await con.execute("INSERT INTO draft_cycles(guild_id) VALUES($1)", guild.id)
             await con.execute("DELETE FROM cycle_exclusions WHERE guild_id=$1", guild.id)
+            await con.execute("DELETE FROM club_limit_bypasses WHERE guild_id=$1", guild.id)
             await con.execute("UPDATE guild_config SET resetting=FALSE WHERE guild_id=$1", guild.id)
             for member in guild.members:
                 if not member.bot and any(r.id == cfg["opt_in_role_id"] for r in member.roles):
@@ -1691,6 +1812,13 @@ class Engine:
                     )
                 managed = await self.role_ids(con, after.guild.id, "country")
                 if (old & managed) != (new & managed):
+                    await con.execute(
+                        "DELETE FROM club_limit_bypasses WHERE guild_id=$1 AND user_id=$2 "
+                        "AND NOT (country_role_id=ANY($3::bigint[]))",
+                        after.guild.id,
+                        after.id,
+                        sorted(new & managed),
+                    )
                     active_op = await con.fetchval(
                         "SELECT 1 FROM role_operations WHERE guild_id=$1 AND user_id=$2 "
                         "AND status IN ('pending','failed')",
@@ -1726,6 +1854,11 @@ class Engine:
                 await self.defer_member_event(con, member.guild.id, member.id)
                 return
             async with con.transaction():
+                await con.execute(
+                    "DELETE FROM club_limit_bypasses WHERE guild_id=$1 AND user_id=$2",
+                    member.guild.id,
+                    member.id,
+                )
                 await con.execute(
                     "UPDATE players SET present=FALSE WHERE guild_id=$1 AND user_id=$2",
                     member.guild.id,

@@ -1121,6 +1121,83 @@ class PostgresTests(unittest.IsolatedAsyncioTestCase):
             ["ATT", "GK"],
         )
 
+    async def test_club_bypass_suppresses_only_approved_extra_and_keeps_country_cap(self):
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE guild_config SET club_limit=3,country_cap=4 WHERE guild_id=$1",
+                self.guild.id,
+            )
+        for uid in range(100, 103):
+            await self.engine.assign(self.guild.player(uid, (8,)), 1, 77)
+        late_joiner = self.guild.player(103, ())
+        await self.engine.assign(late_joiner, 1, 77)
+        late_joiner.roles.append(self.guild.get_role(8))
+        async with self.db.guild(self.guild.id) as con:
+            await self.engine.refresh_player(con, late_joiner)
+            self.assertTrue(await self.engine.flag_capacity(con, self.guild.id, guild=self.guild))
+        await self.engine.set_club_bypass(late_joiner, 77)
+        async with self.db.guild(self.guild.id) as con:
+            population, clubs = await self.engine.counts(con, self.guild.id, guild=self.guild)
+            self.assertEqual(population[1], 4)
+            self.assertEqual(clubs[(1, 8)], 3)
+            self.assertEqual(
+                await self.engine.flag_capacity(con, self.guild.id, guild=self.guild), []
+            )
+        newcomer = self.guild.player(104, ())
+        with self.assertRaisesRegex(RuleError, "player cap"):
+            await self.engine.assign(newcomer, 1, 77, override=True)
+        self.assertFalse(await self.engine.needs_override(late_joiner, 1))
+        await self.engine.set_club_bypass(late_joiner, 77, False)
+        async with self.db.guild(self.guild.id) as con:
+            self.assertTrue(await self.engine.flag_capacity(con, self.guild.id, guild=self.guild))
+
+    async def test_club_bypass_expires_on_country_transfer_and_does_not_follow_player(self):
+        member = self.guild.player(100, (8,))
+        await self.engine.assign(member, 1, 77)
+        await self.engine.set_club_bypass(member, 77)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM club_limit_bypasses"), 1)
+        await self.engine.assign(member, 2, 77)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM club_limit_bypasses"), 0)
+        async with self.db.pool.acquire() as con:
+            _, clubs = await self.engine.counts(con, self.guild.id, guild=self.guild)
+        self.assertEqual(clubs[(2, 8)], 1)
+
+    async def test_club_bypass_expires_on_club_leave_and_reset(self):
+        member = self.guild.player(100, (8,))
+        await self.engine.assign(member, 1, 77)
+        await self.engine.set_club_bypass(member, 77)
+        member.roles = [self.guild.get_role(1)]
+        async with self.db.guild(self.guild.id) as con:
+            await self.engine.refresh_player(con, member)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM club_limit_bypasses"), 0)
+        member.roles.append(self.guild.get_role(8))
+        async with self.db.guild(self.guild.id) as con:
+            await self.engine.refresh_player(con, member)
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM club_limit_bypasses"), 0)
+        await self.engine.set_club_bypass(member, 77)
+        self.assertTrue(await self.engine.start_reset(self.guild, 77))
+        self.assertEqual(await self.fetchval("SELECT count(*) FROM club_limit_bypasses"), 0)
+
+    async def test_club_bypass_survives_restart_but_other_players_cannot_use_it(self):
+        async with self.db.pool.acquire() as con:
+            await con.execute(
+                "UPDATE guild_config SET club_limit=3 WHERE guild_id=$1", self.guild.id
+            )
+        for uid in range(100, 103):
+            await self.engine.assign(self.guild.player(uid, (8,)), 1, 77)
+        late = self.guild.player(103)
+        await self.engine.assign(late, 1, 77, override=True)
+        await self.engine.set_club_bypass(late, 77)
+        restarted = Engine(self.db, self.engine.bot)
+        async with self.db.pool.acquire() as con:
+            _, clubs = await restarted.counts(con, self.guild.id, guild=self.guild)
+        self.assertEqual(clubs[(1, 8)], 3)
+        with self.assertRaisesRegex(RuleError, "Club limit"):
+            await restarted.assign(self.guild.player(104), 1, 77)
+        self.assertEqual(
+            await self.fetchval("SELECT count(*) FROM assignments WHERE status='active'"), 4
+        )
+
     async def test_country_cap_counts_pending_and_cannot_be_manually_overridden(self):
         async with self.db.guild(self.guild.id) as con:
             await con.execute(
